@@ -1,0 +1,25 @@
+exclude: ^(projects/ft8-regr/artifacts/|projects/ft8-regr/golden/|crates/ft8-decoder/data/distilled/.+\.wav$)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt (workspace)
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        files: \.rs$
+      - id: clippy
+        name: clippy (workspace)
+        entry: cargo clippy --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::collapsible_if -A clippy::result_large_err -A clippy::needless_range_loop
+        language: system
+        pass_filenames: false
+        files: \.rs$
