@@ -1,0 +1,69 @@
+{
+  "station": {
+    "our_call": "N1VF",
+    "our_grid": "CM97"
+  },
+  "rig": {
+    "kind": null,
+    "port_path": null,
+    "input_device": null,
+    "output_device": null,
+    "power_setting": null,
+    "power_w": null
+  },
+  "tx": {
+    "base_freq_hz": 1000.0,
+    "drive_level": 0.96,
+    "playback_channels": 2,
+    "output_device": null,
+    "power_w": 20.0,
+    "tx_freq_min_hz": 200.0,
+    "tx_freq_max_hz": 3500.0
+  },
+  "queue": {
+    "auto_add_all_decoded_calls_default": false,
+    "auto_add_decoded_min_count_5m_default": 2,
+    "auto_add_direct_calls_default": true,
+    "ignore_direct_calls_from_recently_worked_default": true,
+    "cq_enabled_default": false,
+    "cq_percent_default": 80,
+    "pause_cq_when_few_unique_calls_default": false,
+    "cq_pause_min_unique_calls_5m_default": 3,
+    "use_compound_rr73_handoff_default": true,
+    "use_compound_73_once_handoff_default": false,
+    "use_compound_for_direct_signal_callers_default": false,
+    "no_message_retry_delay_seconds_default": 35,
+    "no_forward_retry_delay_seconds_default": 300
+  },
+  "fsm": {
+    "rr73_enabled": true,
+    "timeout_seconds": 600,
+    "send_grid": {
+      "no_fwd": 3,
+      "no_msg": 3
+    },
+    "send_sig": {
+      "no_fwd": 3,
+      "no_msg": 3
+    },
+    "send_sig_ack": {
+      "no_fwd": 5,
+      "no_msg": 2
+    },
+    "send_rr73": {
+      "no_fwd": 3
+    },
+    "send_rrr": {
+      "no_fwd": 5,
+      "no_msg": 2
+    },
+    "send_73": {
+      "no_fwd": 3,
+      "no_msg": 2
+    }
+  },
+  "logging": {
+    "fsm_log_path": "logs/ft8op-qso.jsonl",
+    "app_log_path": "logs/ft8op.log"
+  }
+}

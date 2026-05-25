@@ -1,24 +1,110 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    name: Cargo workspace tests
-    runs-on: ubuntu-latest
-
+  pre-commit:
+    name: Pre-commit
+    runs-on: ubuntu-24.04
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
 
-      - name: Run workspace tests
-        run: cargo test --workspace --all-targets --locked
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit
+        run: python3 -m pip install pre-commit
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  unit:
+    name: Unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python ft8-regr tests
+        working-directory: projects/ft8-regr
+        env:
+          PYTHONPATH: src
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+
+      - name: Decoder tests
+        run: cargo test -p ft8_decoder --lib --bins
+
+      - name: Audio library tests
+        run: cargo test -p audiolib
+
+      - name: Rig control tests
+        run: cargo test -p rigctl
+
+      - name: FT8 operating app tests
+        run: cargo test -p ft8op
+
+      - name: Example tests
+        run: |
+          cargo test -p ham-units-example
+          cargo test -p cargo-example
+
+  decoder-distilled:
+    name: Decoder distilled and SNR regressions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: FT4/FT2 distilled mixed regression fixtures
+        run: >
+          cargo test -p ft8_decoder
+          --test distilled_regressions
+          -- --test-threads=1
+
+      - name: Weak-signal decoder SNR regressions
+        run: >
+          cargo test -p ft8_decoder
+          --test snr_regressions
+          -- --test-threads=1

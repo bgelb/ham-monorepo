@@ -2,7 +2,7 @@
 
 This repository is a single workspace for ham radio projects, experiments, and reusable libraries.
 
-Expect many independent projects and libraries to live in different subdirectories. Some may be quick experiments, while others may grow into reusable crates, hardware tools, signal-processing utilities, firmware support code, or complete applications.
+It currently includes reusable Rust crates for audio I/O, rig control, and FT8/FT4/FT2 decode/encode work, plus runnable projects for live weak-signal operation and decoder regression tracking.
 
 ## Repository Layout
 
@@ -10,14 +10,28 @@ Expect many independent projects and libraries to live in different subdirectori
 .
 ├── Cargo.toml
 ├── crates/
-│   └── ham-units-example/
+│   ├── audiolib/
+│   ├── ft8-decoder/
+│   ├── ham-units-example/
+│   └── rigctl/
 └── projects/
-    └── cargo-example/
+    ├── cargo-example/
+    ├── ft8-regr/
+    └── ft8op/
 ```
 
 - `crates/` contains reusable Rust libraries intended to be shared by multiple projects.
 - `projects/` contains applications, experiments, prototypes, and project-specific binaries.
 - A subdirectory may contain its own documentation, tests, examples, and notes.
+
+## Current Components
+
+- `crates/ft8-decoder` is the FT8/FT4/FT2 decoder, encoder, and CLI harness. See [crates/ft8-decoder/README.md](crates/ft8-decoder/README.md).
+- `crates/rigctl` is shared radio control support for K3S and mcHF-style rigs.
+- `crates/audiolib` is shared platform-gated audio capture/playback support.
+- `projects/ft8op` is the live FT8/FT4 operating app with web UI, queueing, QSO automation, rig control, and logging. See [projects/ft8op/README.md](projects/ft8op/README.md).
+- `projects/ft8-regr` is the WSJT-X/Rust decoder regression and reporting project. See [projects/ft8-regr/README.md](projects/ft8-regr/README.md).
+- `projects/ft8-regr/golden` contains curated, checked-in regression snapshots for static viewing. See [projects/ft8-regr/golden/README.md](projects/ft8-regr/golden/README.md).
 
 ## Cargo Workspace Guidelines
 
@@ -41,6 +55,7 @@ Run one project by package name:
 
 ```sh
 cargo run -p cargo-example
+cargo run -p ft8op
 ```
 
 ## Sharing Code Between Subprojects
@@ -73,3 +88,7 @@ Try it with:
 ```sh
 cargo run -p cargo-example
 ```
+
+## Generated Outputs
+
+Generated regression downloads, sample caches, reports, logs, and temporary files are ignored. In particular, `projects/ft8-regr/artifacts/` is scratch output created by the regression tools, while `projects/ft8-regr/golden/` is the curated checked-in archive for selected published snapshots.
