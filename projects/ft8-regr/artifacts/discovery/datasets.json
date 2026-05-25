@@ -1,0 +1,275 @@
+{
+  "generated_at": "2026-05-25T16:35:19+00:00",
+  "datasets": [
+    {
+      "id": "kgoba-ft8-lib",
+      "label": "kgoba/ft8_lib test/wav",
+      "kind": "scored",
+      "description": "Labeled FT8 WAV corpus with companion .txt decode expectations.",
+      "samples": [
+        {
+          "id": "191111_110115",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110115.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110115.txt",
+          "truth_size": 42
+        },
+        {
+          "id": "191111_110130",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110130.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110130.txt",
+          "truth_size": 239
+        },
+        {
+          "id": "191111_110145",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110145.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110145.txt",
+          "truth_size": 79
+        },
+        {
+          "id": "191111_110200",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110200.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110200.txt",
+          "truth_size": 252
+        },
+        {
+          "id": "191111_110215",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110215.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110215.txt",
+          "truth_size": 181
+        },
+        {
+          "id": "191111_110615",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110615.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110615.txt",
+          "truth_size": 973
+        },
+        {
+          "id": "191111_110630",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110630.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110630.txt",
+          "truth_size": 600
+        },
+        {
+          "id": "191111_110645",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110645.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110645.txt",
+          "truth_size": 813
+        },
+        {
+          "id": "191111_110700",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110700.wav",
+          "wav_size": 360202,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/191111_110700.txt",
+          "truth_size": 647
+        },
+        {
+          "id": "websdr_test1",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test1.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test1.txt",
+          "truth_size": 798
+        },
+        {
+          "id": "websdr_test10",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test10.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test10.txt",
+          "truth_size": 647
+        },
+        {
+          "id": "websdr_test11",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test11.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test11.txt",
+          "truth_size": 1031
+        },
+        {
+          "id": "websdr_test12",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test12.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test12.txt",
+          "truth_size": 605
+        },
+        {
+          "id": "websdr_test13",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test13.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test13.txt",
+          "truth_size": 580
+        },
+        {
+          "id": "websdr_test14",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test14.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test14_12k",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test14_12k.wav",
+          "wav_size": 360044
+        },
+        {
+          "id": "websdr_test15",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test15.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test15_12k",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test15_12k.wav",
+          "wav_size": 360044
+        },
+        {
+          "id": "websdr_test16",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test16.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test17",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test17.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test18",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test18.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test19",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test19.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test2",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test2.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test2.txt",
+          "truth_size": 913
+        },
+        {
+          "id": "websdr_test20",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test20.wav",
+          "wav_size": 192044
+        },
+        {
+          "id": "websdr_test3",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test3.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test3.txt",
+          "truth_size": 471
+        },
+        {
+          "id": "websdr_test4",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test4.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test4.txt",
+          "truth_size": 1049
+        },
+        {
+          "id": "websdr_test5",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test5.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test5.txt",
+          "truth_size": 1183
+        },
+        {
+          "id": "websdr_test6",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test6.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test6.txt",
+          "truth_size": 1183
+        },
+        {
+          "id": "websdr_test7",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test7.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test7.txt",
+          "truth_size": 1094
+        },
+        {
+          "id": "websdr_test8",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test8.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test8.txt",
+          "truth_size": 1185
+        },
+        {
+          "id": "websdr_test9",
+          "wav_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test9.wav",
+          "wav_size": 360044,
+          "truth_url": "https://raw.githubusercontent.com/kgoba/ft8_lib/master/test/wav/websdr_test9.txt",
+          "truth_size": 1083
+        }
+      ]
+    },
+    {
+      "id": "d9394-ft8-test-wave",
+      "label": "d9394/ft8_test_wave",
+      "kind": "unscored",
+      "description": "Unlabeled FT8 WAV captures useful for exploratory coverage.",
+      "samples": [
+        {
+          "id": "file-20200330052015",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330052015.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330150900",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330150900.wav",
+          "wav_size": 393260
+        },
+        {
+          "id": "file-20200330153315",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330153315.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330153830",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330153830.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330153900",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330153900.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330153915",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330153915.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330153930",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330153930.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330153945",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330153945.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330154000",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330154000.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330154015",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330154015.wav",
+          "wav_size": 360492
+        },
+        {
+          "id": "file-20200330154030",
+          "wav_url": "https://raw.githubusercontent.com/d9394/ft8_test_wave/master/file-20200330154030.wav",
+          "wav_size": 360492
+        }
+      ]
+    }
+  ]
+}

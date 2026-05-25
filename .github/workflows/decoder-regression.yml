@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: projects/ft8-regr/artifacts/samples
-          key: samples-${{ runner.os }}-${{ hashFiles('projects/ft8-regr/config/sources.json') }}
+          key: samples-${{ runner.os }}-${{ hashFiles('projects/ft8-regr/config/sources.json', 'projects/ft8-regr/artifacts/discovery/datasets.json', 'projects/ft8-regr/artifacts/samples/kgoba-ft8-lib/**/*.txt') }}
 
       - name: Sync sample corpora
         working-directory: projects/ft8-regr

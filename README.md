@@ -91,4 +91,4 @@ cargo run -p cargo-example
 
 ## Generated Outputs
 
-Generated regression downloads, sample caches, reports, logs, and temporary files are ignored. In particular, `projects/ft8-regr/artifacts/` is scratch output created by the regression tools, while `projects/ft8-regr/golden/` is the curated checked-in archive for selected published snapshots.
+Generated regression downloads, WAV sample caches, reports, logs, and temporary files are ignored. In `projects/ft8-regr/artifacts/`, the checked-in exceptions are the dataset discovery manifest and scored truth `.txt` fixtures needed for deterministic CI. `projects/ft8-regr/golden/` remains the curated checked-in archive for selected published snapshots.

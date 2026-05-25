@@ -82,7 +82,7 @@ The main outputs land under:
 - `artifacts/results/latest/`
 - `artifacts/reports/latest/index.html`
 
-The `artifacts/` directory is ignored scratch output. Regenerate it locally or let CI populate it as needed.
+Most of `artifacts/` is ignored scratch output. The checked-in exceptions are the dataset discovery manifest and scored `kgoba-ft8-lib` `.txt` truth fixtures used by CI, so Rust regression expectations are stable even if the upstream sample repository changes. WAV files, release downloads, generated results, and generated reports are still regenerated locally or by CI.
 
 Static saved copies of notable full regression runs can be checked into:
 

@@ -19,9 +19,9 @@
     "decode_count": 538,
     "truth_count": 429,
     "scored_truth_count": 418,
-    "tp": 408,
-    "fp": 7,
-    "fn": 10
+    "tp": 409,
+    "fp": 6,
+    "fn": 9
   },
   {
     "profile_id": "medium",
@@ -43,8 +43,8 @@
     "decode_count": 513,
     "truth_count": 429,
     "scored_truth_count": 418,
-    "tp": 390,
-    "fp": 6,
-    "fn": 28
+    "tp": 392,
+    "fp": 4,
+    "fn": 26
   }
 ]
