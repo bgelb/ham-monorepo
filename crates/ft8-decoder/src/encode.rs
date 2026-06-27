@@ -65,6 +65,11 @@ pub enum TxMessage {
         my_call: String,
         my_grid: Option<String>,
     },
+    CqToken {
+        token: String,
+        my_call: String,
+        my_grid: Option<String>,
+    },
     Directed {
         my_call: String,
         peer_call: String,
@@ -927,6 +932,26 @@ fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, 
                 .map(|grid| format!("CQ {} {}", my_call.trim(), grid.trim().to_uppercase()))
                 .unwrap_or_else(|| format!("CQ {}", my_call.trim())),
         ),
+        TxMessage::CqToken {
+            token,
+            my_call,
+            my_grid,
+        } => {
+            let token = token.trim().to_uppercase();
+            (
+                token.clone(),
+                my_call.clone(),
+                false,
+                my_grid
+                    .as_ref()
+                    .map(|grid| GridReport::Grid(grid.trim().to_uppercase()))
+                    .unwrap_or(GridReport::Blank),
+                my_grid
+                    .as_ref()
+                    .map(|grid| format!("{token} {} {}", my_call.trim(), grid.trim().to_uppercase()))
+                    .unwrap_or_else(|| format!("{token} {}", my_call.trim())),
+            )
+        }
         TxMessage::Directed {
             my_call,
             peer_call,

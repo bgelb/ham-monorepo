@@ -27,6 +27,7 @@ pub struct StationStartInfo {
     pub last_snr_db: i32,
     pub last_text: Option<String>,
     pub last_structured_json: Option<String>,
+    pub received_fd_exchange: Option<FieldDayExchange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +63,24 @@ pub enum QsoCommand {
 
 #[derive(Debug, Clone)]
 pub struct QsoOutcome {
+    pub session_id: u64,
     pub partner_call: String,
     pub exit_reason: String,
+    pub started_at: SystemTime,
     pub finished_at: SystemTime,
+    pub rig_frequency_hz: Option<u64>,
     pub rig_band: Option<String>,
+    pub app_mode: Mode,
     pub sent_terminal_73: bool,
+    pub exchange_mode: ExchangeMode,
+    pub field_day_mode_active: bool,
+    pub field_day_only: bool,
+    pub sent_fd_exchange: bool,
+    pub sent_fd_exchange_text: String,
+    pub received_fd_exchange: Option<FieldDayExchange>,
+    pub contest_exchange_received: bool,
+    pub completion_confidence: CompletionConfidence,
+    pub last_rx_event: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,11 +99,70 @@ pub struct CompoundHandoffPlan {
     pub next_station: StationStartInfo,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotFamily {
     Even,
     Odd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeMode {
+    Normal,
+    FieldDay,
+}
+
+impl ExchangeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::FieldDay => "field_day",
+        }
+    }
+
+    fn is_field_day(self) -> bool {
+        self == Self::FieldDay
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldDayExchange {
+    pub transmitter_count: u8,
+    pub class: char,
+    pub section: String,
+}
+
+impl FieldDayExchange {
+    pub fn new(transmitter_count: u8, class: char, section: String) -> Self {
+        Self {
+            transmitter_count: transmitter_count.clamp(1, 32),
+            class: class.to_ascii_uppercase(),
+            section: section.trim().to_uppercase(),
+        }
+    }
+
+    pub fn as_text(&self) -> String {
+        format!("{}{} {}", self.transmitter_count, self.class, self.section)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionConfidence {
+    Confirmed,
+    Probable,
+    Insufficient,
+}
+
+impl CompletionConfidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Probable => "probable",
+            Self::Insufficient => "insufficient",
+        }
+    }
 }
 
 impl SlotFamily {
@@ -196,6 +269,9 @@ impl Default for WebQsoSnapshot {
 pub struct QsoController {
     config: AppConfig,
     backend: Box<dyn TxBackend>,
+    field_day_mode_active: bool,
+    field_day_only: bool,
+    field_day_exchange: FieldDayExchange,
     next_session_id: u64,
     session: Option<ActiveSession>,
     immediate_start_slot: Option<SystemTime>,
@@ -212,7 +288,15 @@ impl QsoController {
             selected_tx_freq_hz: Some(config.clamped_default_tx_freq_hz()),
             ..WebQsoSnapshot::default()
         };
+        let field_day_exchange = FieldDayExchange::new(
+            config.field_day.transmitter_count,
+            config.field_day.class,
+            config.field_day.section.clone(),
+        );
         Self {
+            field_day_mode_active: config.field_day.enabled_default,
+            field_day_only: config.field_day.fd_only_default,
+            field_day_exchange,
             config,
             backend,
             next_session_id: 1,
@@ -223,6 +307,25 @@ impl QsoController {
             current_rig_frequency_hz: None,
             current_rig_band: None,
             current_app_mode: Mode::Ft8,
+        }
+    }
+
+    pub fn set_field_day_runtime(
+        &mut self,
+        enabled: bool,
+        fd_only: bool,
+        exchange: FieldDayExchange,
+    ) {
+        self.field_day_mode_active = enabled;
+        self.field_day_only = fd_only;
+        self.field_day_exchange = exchange;
+    }
+
+    fn current_exchange_mode(&self) -> ExchangeMode {
+        if self.field_day_mode_active && self.current_app_mode == Mode::Ft8 {
+            ExchangeMode::FieldDay
+        } else {
+            ExchangeMode::Normal
         }
     }
 
@@ -317,7 +420,7 @@ impl QsoController {
             Self::restore_rx_slot_baseline_for_full(session, slot_start);
         }
 
-        let event = if session.state == QsoState::SendCq {
+        let event = if session.state == QsoState::SendCq && !session.exchange_mode.is_field_day() {
             PartnerEvent::None
         } else {
             classify_partner_event(
@@ -372,6 +475,15 @@ impl QsoController {
         if let Some(snr_db) = event.snr_db() {
             session.latest_partner_snr_db = snr_db;
         }
+        if session.state == QsoState::SendCq
+            && let PartnerEvent::ToUs { from_call, .. } = &event
+            && !from_call.is_empty()
+        {
+            session.partner_call = from_call.clone();
+        }
+        if let Some(exchange) = event.field_day_exchange() {
+            session.received_fd_exchange = Some(exchange);
+        }
         if event.has_partner_message() {
             session.partner_rx_count += 1;
         }
@@ -402,12 +514,45 @@ impl QsoController {
         match previous_state {
             QsoState::Idle => {}
             QsoState::SendCq => {
-                session.no_msg_count += 1;
-                if session.no_msg_count >= self.config.fsm.send_grid.no_msg {
-                    exit_reason = Some("send_cq_no_msg_limit");
+                if session.exchange_mode.is_field_day() {
+                    match event {
+                        PartnerEvent::ToUs {
+                            event:
+                                ToUsEvent::FieldDayExchange {
+                                    acknowledge: true, ..
+                                },
+                            ..
+                        } => next_state = QsoState::SendRR73,
+                        PartnerEvent::ToUs {
+                            event: ToUsEvent::FieldDayExchange { .. },
+                            ..
+                        } => next_state = QsoState::SendSigAck,
+                        _ => {
+                            session.no_msg_count += 1;
+                            if session.no_msg_count >= self.config.fsm.send_grid.no_msg {
+                                exit_reason = Some("send_cq_no_msg_limit");
+                            }
+                        }
+                    }
+                } else {
+                    session.no_msg_count += 1;
+                    if session.no_msg_count >= self.config.fsm.send_grid.no_msg {
+                        exit_reason = Some("send_cq_no_msg_limit");
+                    }
                 }
             }
             QsoState::SendGrid => match event {
+                PartnerEvent::ToUs {
+                    event:
+                        ToUsEvent::FieldDayExchange {
+                            acknowledge: true, ..
+                        },
+                    ..
+                } => next_state = QsoState::SendRR73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::FieldDayExchange { .. },
+                    ..
+                } => next_state = QsoState::SendSigAck,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Ack,
                     ..
@@ -441,6 +586,17 @@ impl QsoController {
                 }
             },
             QsoState::SendSig => match event {
+                PartnerEvent::ToUs {
+                    event:
+                        ToUsEvent::FieldDayExchange {
+                            acknowledge: true, ..
+                        },
+                    ..
+                } => next_state = QsoState::SendRR73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::FieldDayExchange { .. },
+                    ..
+                } => next_state = QsoState::SendSigAck,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Reply(ReplyWord::SeventyThree),
                     ..
@@ -484,6 +640,22 @@ impl QsoController {
                 }
             },
             QsoState::SendSigAck => match event {
+                PartnerEvent::ToUs {
+                    event:
+                        ToUsEvent::FieldDayExchange {
+                            acknowledge: true, ..
+                        },
+                    ..
+                } => next_state = QsoState::SendRR73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::FieldDayExchange { .. },
+                    ..
+                } => {
+                    session.no_fwd_count += 1;
+                    if session.no_fwd_count >= self.config.fsm.send_sig_ack.no_fwd {
+                        next_state = QsoState::Send73Once;
+                    }
+                }
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Reply(ReplyWord::Rr73),
                     ..
@@ -1007,6 +1179,11 @@ impl QsoController {
                 ) {
                     session.sent_terminal_73 = true;
                 }
+                if session.exchange_mode.is_field_day()
+                    && matches!(session.state, QsoState::SendGrid | QsoState::SendSigAck)
+                {
+                    session.sent_fd_exchange = true;
+                }
                 session.in_flight_tx =
                     Some(update_in_flight_from_request(session, &launched_request));
                 session.next_tx_slot = None;
@@ -1470,6 +1647,10 @@ impl QsoController {
             },
             state: initial_state,
             start_mode,
+            exchange_mode: self.current_exchange_mode(),
+            field_day_mode_active: self.field_day_mode_active,
+            field_day_only: self.field_day_only,
+            field_day_exchange: self.field_day_exchange.clone(),
             tx_slot_family: slot_family_for_mode(self.current_app_mode, target_slot),
             tx_freq_hz,
             latest_partner_snr_db: station_info
@@ -1510,6 +1691,11 @@ impl QsoController {
                 initial_state,
                 QsoState::SendRR73 | QsoState::Send73 | QsoState::Send73Once
             ),
+            sent_fd_exchange: matches!(initial_state, QsoState::SendSigAck | QsoState::SendRR73)
+                && self.current_exchange_mode().is_field_day(),
+            received_fd_exchange: station_info
+                .as_ref()
+                .and_then(|info| info.received_fd_exchange.clone()),
         };
         let request = build_tx_request(&self.config, &session, target_slot);
         let Ok(updated) = self.backend.update_pending(request.clone()) else {
@@ -1647,6 +1833,10 @@ impl QsoController {
             },
             state: initial_state,
             start_mode,
+            exchange_mode: self.current_exchange_mode(),
+            field_day_mode_active: self.field_day_mode_active,
+            field_day_only: self.field_day_only,
+            field_day_exchange: self.field_day_exchange.clone(),
             tx_slot_family,
             tx_freq_hz,
             latest_partner_snr_db: station_info
@@ -1685,6 +1875,11 @@ impl QsoController {
             provisional_rx_decision: None,
             transcript: VecDeque::new(),
             sent_terminal_73: false,
+            sent_fd_exchange: matches!(initial_state, QsoState::SendRR73)
+                && self.current_exchange_mode().is_field_day(),
+            received_fd_exchange: station_info
+                .as_ref()
+                .and_then(|info| info.received_fd_exchange.clone()),
         };
         self.next_session_id += 1;
         if let Some(text) = station_info
@@ -1763,6 +1958,26 @@ impl QsoController {
                 session_id = session.session_id,
                 partner_call = %session.partner_call,
                 start_mode = %session.start_mode.as_str(),
+                exchange_mode = %session.exchange_mode.as_str(),
+                field_day_mode_active = session.field_day_mode_active,
+                field_day_only = session.field_day_only,
+                sent_fd_exchange = session.sent_fd_exchange,
+                received_fd_exchange = session
+                    .received_fd_exchange
+                    .as_ref()
+                    .map(FieldDayExchange::as_text)
+                    .unwrap_or_default(),
+                received_fd_class = session
+                    .received_fd_exchange
+                    .as_ref()
+                    .map(|exchange| exchange.class.to_string())
+                    .unwrap_or_default(),
+                received_fd_section = session
+                    .received_fd_exchange
+                    .as_ref()
+                    .map(|exchange| exchange.section.clone())
+                    .unwrap_or_default(),
+                contest_exchange_received = session.received_fd_exchange.is_some(),
                 rig_frequency_hz = session.rig_frequency_hz.unwrap_or_default(),
                 rig_band = session.rig_band.clone().unwrap_or_default(),
                 app_mode = %session.app_mode.as_str(),
@@ -1841,14 +2056,28 @@ impl QsoController {
             timeout_remaining_seconds: None,
             tx_active: self.backend.is_active(),
             last_rx_event: session.last_rx_event.clone(),
-            transcript: session.transcript.into_iter().collect(),
+            transcript: session.transcript.iter().cloned().collect(),
         };
+        let completion_confidence = completion_confidence_for_session(&session, reason);
         self.pending_outcomes.push_back(QsoOutcome {
+            session_id: session.session_id,
             partner_call: session.partner_call,
             exit_reason: reason.to_string(),
+            started_at: session.started_at,
             finished_at: now,
+            rig_frequency_hz: session.rig_frequency_hz,
             rig_band: session.rig_band,
+            app_mode: session.app_mode,
             sent_terminal_73: session.sent_terminal_73,
+            exchange_mode: session.exchange_mode,
+            field_day_mode_active: session.field_day_mode_active,
+            field_day_only: session.field_day_only,
+            sent_fd_exchange: session.sent_fd_exchange,
+            sent_fd_exchange_text: session.field_day_exchange.as_text(),
+            received_fd_exchange: session.received_fd_exchange.clone(),
+            contest_exchange_received: session.received_fd_exchange.is_some(),
+            completion_confidence,
+            last_rx_event: session.last_rx_event,
         });
     }
 
@@ -1887,6 +2116,26 @@ impl QsoController {
             session_id = session.session_id,
             partner_call = %session.partner_call,
             start_mode = %session.start_mode.as_str(),
+            exchange_mode = %session.exchange_mode.as_str(),
+            field_day_mode_active = session.field_day_mode_active,
+            field_day_only = session.field_day_only,
+            sent_fd_exchange = session.sent_fd_exchange,
+            received_fd_exchange = session
+                .received_fd_exchange
+                .as_ref()
+                .map(FieldDayExchange::as_text)
+                .unwrap_or_default(),
+            received_fd_class = session
+                .received_fd_exchange
+                .as_ref()
+                .map(|exchange| exchange.class.to_string())
+                .unwrap_or_default(),
+            received_fd_section = session
+                .received_fd_exchange
+                .as_ref()
+                .map(|exchange| exchange.section.clone())
+                .unwrap_or_default(),
+            contest_exchange_received = session.received_fd_exchange.is_some(),
             rig_frequency_hz = session.rig_frequency_hz.unwrap_or_default(),
             rig_band = session.rig_band.clone().unwrap_or_default(),
             app_mode = %session.app_mode.as_str(),
@@ -1960,6 +2209,26 @@ impl QsoController {
             wall_ts = %format_timestamp(now),
             session_id = session.session_id,
             partner_call = %session.partner_call,
+            exchange_mode = %session.exchange_mode.as_str(),
+            field_day_mode_active = session.field_day_mode_active,
+            field_day_only = session.field_day_only,
+            sent_fd_exchange = session.sent_fd_exchange,
+            received_fd_exchange = session
+                .received_fd_exchange
+                .as_ref()
+                .map(FieldDayExchange::as_text)
+                .unwrap_or_default(),
+            received_fd_class = session
+                .received_fd_exchange
+                .as_ref()
+                .map(|exchange| exchange.class.to_string())
+                .unwrap_or_default(),
+            received_fd_section = session
+                .received_fd_exchange
+                .as_ref()
+                .map(|exchange| exchange.section.clone())
+                .unwrap_or_default(),
+            contest_exchange_received = session.received_fd_exchange.is_some(),
             committed_slot = %format_timestamp(in_flight.target_slot),
             committed_state = %in_flight.state.as_str(),
             committed_tx_text = %in_flight.message_text,
@@ -2143,6 +2412,15 @@ impl QsoController {
         if let Some(snr_db) = event.snr_db() {
             session.latest_partner_snr_db = snr_db;
         }
+        if session.state == QsoState::SendCq
+            && let PartnerEvent::ToUs { from_call, .. } = event
+            && !from_call.is_empty()
+        {
+            session.partner_call = from_call.clone();
+        }
+        if let Some(exchange) = event.field_day_exchange() {
+            session.received_fd_exchange = Some(exchange);
+        }
         if event.has_partner_message() {
             session.partner_rx_count += 1;
         }
@@ -2159,12 +2437,45 @@ impl QsoController {
         match previous_state {
             QsoState::Idle => {}
             QsoState::SendCq => {
-                session.no_msg_count += 1;
-                if session.no_msg_count >= config.fsm.send_grid.no_msg {
-                    exit_reason = Some("send_cq_no_msg_limit".to_string());
+                if session.exchange_mode.is_field_day() {
+                    match event {
+                        PartnerEvent::ToUs {
+                            event:
+                                ToUsEvent::FieldDayExchange {
+                                    acknowledge: true, ..
+                                },
+                            ..
+                        } => next_state = QsoState::SendRR73,
+                        PartnerEvent::ToUs {
+                            event: ToUsEvent::FieldDayExchange { .. },
+                            ..
+                        } => next_state = QsoState::SendSigAck,
+                        _ => {
+                            session.no_msg_count += 1;
+                            if session.no_msg_count >= config.fsm.send_grid.no_msg {
+                                exit_reason = Some("send_cq_no_msg_limit".to_string());
+                            }
+                        }
+                    }
+                } else {
+                    session.no_msg_count += 1;
+                    if session.no_msg_count >= config.fsm.send_grid.no_msg {
+                        exit_reason = Some("send_cq_no_msg_limit".to_string());
+                    }
                 }
             }
             QsoState::SendGrid => match event {
+                PartnerEvent::ToUs {
+                    event:
+                        ToUsEvent::FieldDayExchange {
+                            acknowledge: true, ..
+                        },
+                    ..
+                } => next_state = QsoState::SendRR73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::FieldDayExchange { .. },
+                    ..
+                } => next_state = QsoState::SendSigAck,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Ack,
                     ..
@@ -2198,6 +2509,17 @@ impl QsoController {
                 }
             },
             QsoState::SendSig => match event {
+                PartnerEvent::ToUs {
+                    event:
+                        ToUsEvent::FieldDayExchange {
+                            acknowledge: true, ..
+                        },
+                    ..
+                } => next_state = QsoState::SendRR73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::FieldDayExchange { .. },
+                    ..
+                } => next_state = QsoState::SendSigAck,
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Reply(ReplyWord::SeventyThree),
                     ..
@@ -2241,6 +2563,22 @@ impl QsoController {
                 }
             },
             QsoState::SendSigAck => match event {
+                PartnerEvent::ToUs {
+                    event:
+                        ToUsEvent::FieldDayExchange {
+                            acknowledge: true, ..
+                        },
+                    ..
+                } => next_state = QsoState::SendRR73,
+                PartnerEvent::ToUs {
+                    event: ToUsEvent::FieldDayExchange { .. },
+                    ..
+                } => {
+                    session.no_fwd_count += 1;
+                    if session.no_fwd_count >= config.fsm.send_sig_ack.no_fwd {
+                        next_state = QsoState::Send73Once;
+                    }
+                }
                 PartnerEvent::ToUs {
                     event: ToUsEvent::Reply(ReplyWord::Rr73),
                     ..
@@ -2375,6 +2713,10 @@ struct ActiveSession {
     partner_call: String,
     state: QsoState,
     start_mode: QsoStartMode,
+    exchange_mode: ExchangeMode,
+    field_day_mode_active: bool,
+    field_day_only: bool,
+    field_day_exchange: FieldDayExchange,
     tx_slot_family: SlotFamily,
     tx_freq_hz: f32,
     latest_partner_snr_db: i32,
@@ -2402,6 +2744,8 @@ struct ActiveSession {
     provisional_rx_decision: Option<ProvisionalRxDecision>,
     transcript: VecDeque<WebQsoTranscriptEntry>,
     sent_terminal_73: bool,
+    sent_fd_exchange: bool,
+    received_fd_exchange: Option<FieldDayExchange>,
 }
 
 #[derive(Debug, Clone)]
@@ -2718,6 +3062,7 @@ enum PartnerEvent {
     None,
     ToUs {
         event: ToUsEvent,
+        from_call: String,
         text: String,
         structured_json: String,
         snr_db: i32,
@@ -2754,6 +3099,13 @@ impl PartnerEvent {
             Self::ToUs { event, .. } => match event {
                 ToUsEvent::Ack => "to_us_ack".to_string(),
                 ToUsEvent::ReportLike => "to_us_report_like".to_string(),
+                ToUsEvent::FieldDayExchange { acknowledge, .. } => {
+                    if *acknowledge {
+                        "to_us_fd_exchange_ack".to_string()
+                    } else {
+                        "to_us_fd_exchange".to_string()
+                    }
+                }
                 ToUsEvent::Reply(reply) => {
                     format!("to_us_reply_{}", reply_text(*reply).to_ascii_lowercase())
                 }
@@ -2818,12 +3170,26 @@ impl PartnerEvent {
             Self::None | Self::Freeform { .. } => None,
         }
     }
+
+    fn field_day_exchange(&self) -> Option<FieldDayExchange> {
+        match self {
+            Self::ToUs {
+                event: ToUsEvent::FieldDayExchange { exchange, .. },
+                ..
+            } => Some(exchange.clone()),
+            _ => None,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ToUsEvent {
     Ack,
     ReportLike,
+    FieldDayExchange {
+        acknowledge: bool,
+        exchange: FieldDayExchange,
+    },
     Reply(ReplyWord),
     Other,
 }
@@ -2833,6 +3199,63 @@ fn build_tx_request(
     session: &ActiveSession,
     target_slot: SystemTime,
 ) -> TxRequest {
+    if session.exchange_mode.is_field_day() {
+        let message = match session.state {
+            QsoState::SendCq => TxMessage::CqToken {
+                token: "CQ FD".to_string(),
+                my_call: config.station.our_call.clone(),
+                my_grid: Some(config.station.our_grid.clone()),
+            },
+            QsoState::SendGrid => TxMessage::FieldDay {
+                first_call: session.partner_call.clone(),
+                second_call: config.station.our_call.clone(),
+                acknowledge: false,
+                transmitter_count: session.field_day_exchange.transmitter_count,
+                class: session.field_day_exchange.class,
+                section: session.field_day_exchange.section.clone(),
+            },
+            QsoState::SendSig | QsoState::SendSigAck => TxMessage::FieldDay {
+                first_call: session.partner_call.clone(),
+                second_call: config.station.our_call.clone(),
+                acknowledge: true,
+                transmitter_count: session.field_day_exchange.transmitter_count,
+                class: session.field_day_exchange.class,
+                section: session.field_day_exchange.section.clone(),
+            },
+            QsoState::SendRR73 => TxMessage::Directed {
+                my_call: config.station.our_call.clone(),
+                peer_call: session.partner_call.clone(),
+                payload: TxDirectedPayload::Reply(ReplyWord::Rr73),
+            },
+            QsoState::SendRRR => TxMessage::Directed {
+                my_call: config.station.our_call.clone(),
+                peer_call: session.partner_call.clone(),
+                payload: TxDirectedPayload::Reply(ReplyWord::Rrr),
+            },
+            QsoState::Send73 | QsoState::Send73Once => TxMessage::Directed {
+                my_call: config.station.our_call.clone(),
+                peer_call: session.partner_call.clone(),
+                payload: TxDirectedPayload::Reply(ReplyWord::SeventyThree),
+            },
+            QsoState::Idle => TxMessage::Directed {
+                my_call: config.station.our_call.clone(),
+                peer_call: session.partner_call.clone(),
+                payload: TxDirectedPayload::Blank,
+            },
+        };
+        let message_text = render_tx_message(config, session);
+        return TxRequest {
+            session_id: session.session_id,
+            target_slot,
+            state: session.state,
+            message,
+            message_text,
+            tx_freq_hz: session.tx_freq_hz,
+            drive_level: config.tx.drive_level,
+            playback_channels: config.tx.playback_channels,
+            app_mode: session.app_mode,
+        };
+    }
     let payload = match session.state {
         QsoState::Idle => TxDirectedPayload::Blank,
         QsoState::SendCq => TxDirectedPayload::Blank,
@@ -2896,6 +3319,36 @@ fn build_tx_request(
 }
 
 fn render_tx_message(config: &AppConfig, session: &ActiveSession) -> String {
+    if session.exchange_mode.is_field_day() {
+        return match session.state {
+            QsoState::Idle => String::new(),
+            QsoState::SendCq => format!(
+                "CQ FD {} {}",
+                config.station.our_call, config.station.our_grid
+            ),
+            QsoState::SendGrid => format!(
+                "{} {} {}",
+                session.partner_call,
+                config.station.our_call,
+                session.field_day_exchange.as_text()
+            ),
+            QsoState::SendSig | QsoState::SendSigAck => format!(
+                "{} {} R {}",
+                session.partner_call,
+                config.station.our_call,
+                session.field_day_exchange.as_text()
+            ),
+            QsoState::SendRR73 => {
+                format!("{} {} RR73", session.partner_call, config.station.our_call)
+            }
+            QsoState::SendRRR => {
+                format!("{} {} RRR", session.partner_call, config.station.our_call)
+            }
+            QsoState::Send73 | QsoState::Send73Once => {
+                format!("{} {} 73", session.partner_call, config.station.our_call)
+            }
+        };
+    }
     if let Some(handoff) = &session.pending_compound_handoff {
         if matches!(session.state, QsoState::SendRR73 | QsoState::Send73Once) {
             return handoff.tx_text.clone();
@@ -2967,6 +3420,11 @@ fn try_late_bind_session_update(
     ) {
         proposed.sent_terminal_73 = true;
     }
+    if proposed.exchange_mode.is_field_day()
+        && matches!(request.state, QsoState::SendGrid | QsoState::SendSigAck)
+    {
+        proposed.sent_fd_exchange = true;
+    }
     proposed.last_tx_slot = Some(target_slot);
     proposed.next_tx_slot = None;
     let proposed_state = proposed.state;
@@ -2993,6 +3451,47 @@ fn clamp_report_db(value: i32) -> i16 {
     value.clamp(REPORT_MIN_DB, REPORT_MAX_DB) as i16
 }
 
+fn completion_confidence_for_session(
+    session: &ActiveSession,
+    reason: &str,
+) -> CompletionConfidence {
+    if !session.exchange_mode.is_field_day() {
+        return if session.sent_terminal_73 && session.partner_rx_count > 0 {
+            CompletionConfidence::Probable
+        } else {
+            CompletionConfidence::Insufficient
+        };
+    }
+    let received_exchange = session.received_fd_exchange.is_some();
+    let terminal_rx = matches!(
+        session.last_rx_event.as_deref(),
+        Some("to_us_reply_rr73" | "to_us_reply_73")
+    );
+    if session.sent_fd_exchange
+        && received_exchange
+        && (session.sent_terminal_73 || terminal_rx || reason.contains("confirmed"))
+    {
+        CompletionConfidence::Confirmed
+    } else if session.sent_fd_exchange
+        && received_exchange
+        && !matches!(
+            reason,
+            "send_grid_no_msg_limit"
+                | "send_grid_no_fwd_limit"
+                | "send_sig_no_msg_limit"
+                | "send_sig_no_fwd_limit"
+                | "timeout"
+                | "tx_launch_failed"
+        )
+    {
+        CompletionConfidence::Probable
+    } else if session.sent_fd_exchange && session.sent_terminal_73 {
+        CompletionConfidence::Probable
+    } else {
+        CompletionConfidence::Insufficient
+    }
+}
+
 fn classify_partner_event(
     decodes: &[ft8_decoder::DecodedMessage],
     partner_call: &str,
@@ -3007,14 +3506,15 @@ fn classify_partner_event(
 
     for decode in decodes {
         let sender = semantic_sender_call(&decode.message);
-        if sender.as_deref() != Some(partner_call) {
+        if partner_call != "CQ" && sender.as_deref() != Some(partner_call) {
             continue;
         }
         match classify_single_message(&decode.message, our_call, state) {
             SingleClass::ToUs(event) => {
-                let score = to_us_priority(event, state);
+                let score = to_us_priority(event.clone(), state);
                 let candidate = PartnerEvent::ToUs {
                     event,
+                    from_call: sender.clone().unwrap_or_default(),
                     text: decode.text.clone(),
                     structured_json: serialize_structured_message(&decode.message),
                     snr_db: decode.snr_db,
@@ -3190,9 +3690,36 @@ fn classify_single_message(
                 SingleClass::Irrelevant
             }
         }
-        StructuredMessage::FieldDay { .. }
-        | StructuredMessage::RttyContest { .. }
-        | StructuredMessage::EuVhf { .. } => SingleClass::Freeform,
+        StructuredMessage::FieldDay {
+            first,
+            acknowledge,
+            transmitter_count,
+            class,
+            section,
+            ..
+        } => {
+            let target = structured_call_station_name(first);
+            if target.as_deref() == Some(our_call) {
+                SingleClass::ToUs(ToUsEvent::FieldDayExchange {
+                    acknowledge: *acknowledge,
+                    exchange: FieldDayExchange::new(*transmitter_count, *class, section.clone()),
+                })
+            } else if target.is_some() {
+                if matches!(
+                    state,
+                    QsoState::Send73 | QsoState::SendRR73 | QsoState::SendRRR
+                ) {
+                    SingleClass::ToOther
+                } else {
+                    SingleClass::Irrelevant
+                }
+            } else {
+                SingleClass::Irrelevant
+            }
+        }
+        StructuredMessage::RttyContest { .. } | StructuredMessage::EuVhf { .. } => {
+            SingleClass::Freeform
+        }
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => {
             SingleClass::Freeform
         }
@@ -3203,12 +3730,20 @@ fn to_us_priority(event: ToUsEvent, state: QsoState) -> u8 {
     match state {
         QsoState::SendCq => 1,
         QsoState::SendGrid => match event {
+            ToUsEvent::FieldDayExchange {
+                acknowledge: true, ..
+            } => 5,
+            ToUsEvent::FieldDayExchange { .. } => 4,
             ToUsEvent::Reply(_) => 4,
             ToUsEvent::Ack => 3,
             ToUsEvent::ReportLike => 3,
             ToUsEvent::Other => 1,
         },
         QsoState::SendSig => match event {
+            ToUsEvent::FieldDayExchange {
+                acknowledge: true, ..
+            } => 5,
+            ToUsEvent::FieldDayExchange { .. } => 3,
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 5,
             ToUsEvent::Ack => 4,
             ToUsEvent::Reply(_) => 4,
@@ -3216,20 +3751,27 @@ fn to_us_priority(event: ToUsEvent, state: QsoState) -> u8 {
             ToUsEvent::Other => 1,
         },
         QsoState::SendSigAck => match event {
+            ToUsEvent::FieldDayExchange {
+                acknowledge: true, ..
+            } => 5,
+            ToUsEvent::FieldDayExchange { .. } => 2,
             ToUsEvent::Reply(_) => 4,
             ToUsEvent::Ack => 4,
             ToUsEvent::ReportLike => 1,
             ToUsEvent::Other => 1,
         },
         QsoState::SendRR73 => match event {
+            ToUsEvent::FieldDayExchange { .. } => 1,
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 4,
             ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::ReportLike | ToUsEvent::Other => 1,
         },
         QsoState::SendRRR => match event {
+            ToUsEvent::FieldDayExchange { .. } => 1,
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 4,
             ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::ReportLike | ToUsEvent::Other => 1,
         },
         QsoState::Send73 => match event {
+            ToUsEvent::FieldDayExchange { .. } => 1,
             ToUsEvent::Reply(ReplyWord::SeventyThree) => 4,
             ToUsEvent::Reply(_) | ToUsEvent::Ack | ToUsEvent::ReportLike | ToUsEvent::Other => 1,
         },
@@ -3708,8 +4250,8 @@ fn serialize_structured_message(message: &StructuredMessage) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, StationConfig,
-        TxConfig,
+        FieldDayConfig, FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds,
+        StationConfig, TxConfig,
     };
     use ft8_decoder::{
         DecodeOptions, DecodeProfile, DecodedMessage, DecoderSession, HashedCallField10,
@@ -3921,15 +4463,60 @@ mod tests {
                 fsm_log_path: "logs/test.jsonl".to_string(),
                 app_log_path: "logs/test.log".to_string(),
             },
+            field_day: FieldDayConfig::default(),
         }
     }
 
     fn directed_decode(from: &str, to: &str, event: ToUsEvent) -> DecodedMessage {
+        if let ToUsEvent::FieldDayExchange {
+            acknowledge,
+            exchange,
+        } = event
+        {
+            return DecodedMessage {
+                utc: "00:00:00".to_string(),
+                snr_db: -7,
+                dt_seconds: 0.1,
+                freq_hz: 1000.0,
+                text: format!(
+                    "{from} {to} {}{} {}{}",
+                    if acknowledge { "R " } else { "" },
+                    exchange.transmitter_count,
+                    exchange.class,
+                    exchange.section
+                ),
+                candidate_score: 0.0,
+                ldpc_iterations: 0,
+                message: StructuredMessage::FieldDay {
+                    i3: 0,
+                    n3: 3,
+                    first: StructuredCallField {
+                        raw: 0,
+                        modifier: None,
+                        value: StructuredCallValue::StandardCall {
+                            callsign: to.to_string(),
+                        },
+                    },
+                    second: StructuredCallField {
+                        raw: 0,
+                        modifier: None,
+                        value: StructuredCallValue::StandardCall {
+                            callsign: from.to_string(),
+                        },
+                    },
+                    acknowledge,
+                    transmitter_count: exchange.transmitter_count,
+                    class: exchange.class,
+                    section: exchange.section,
+                },
+            };
+        }
         let acknowledge = matches!(event, ToUsEvent::Ack);
         let info = match event {
             ToUsEvent::Ack | ToUsEvent::Other => ft8_decoder::StructuredInfoValue::Blank,
             ToUsEvent::ReportLike => ft8_decoder::StructuredInfoValue::SignalReport { db: -8 },
             ToUsEvent::Reply(word) => ft8_decoder::StructuredInfoValue::Reply { word },
+            ToUsEvent::FieldDayExchange { .. } => unreachable!(),
         };
         DecodedMessage {
             utc: "00:00:00".to_string(),
@@ -4105,6 +4692,7 @@ mod tests {
             last_snr_db: -9,
             last_text: None,
             last_structured_json: None,
+            received_fd_exchange: None,
         }
     }
 
@@ -4116,6 +4704,123 @@ mod tests {
             start_mode: QsoStartMode::Normal,
             tx_slot_family_override: None,
         }
+    }
+
+    fn enable_field_day(controller: &mut QsoController) {
+        controller.set_field_day_runtime(
+            true,
+            true,
+            FieldDayExchange::new(1, 'E', "SCV".to_string()),
+        );
+    }
+
+    #[test]
+    fn field_day_send_grid_transmits_exchange() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        enable_field_day(&mut controller);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        let tx_slot = first_matching_slot_after(now, SlotFamily::Even, Mode::Ft8);
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft8));
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft8));
+        let snapshot = controller.snapshot(now);
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .any(|entry| entry.direction == "TX:" && entry.text == "K1ABC N1VF 1E SCV")
+        );
+    }
+
+    #[test]
+    fn field_day_cq_direct_exchange_transitions_to_ack_exchange() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        enable_field_day(&mut controller);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "CQ".to_string(),
+                tx_freq_hz: 1000.0,
+                initial_state: QsoState::SendCq,
+                start_mode: QsoStartMode::Cq,
+                tx_slot_family_override: Some(SlotFamily::Odd),
+            },
+            None,
+            now,
+        );
+        let rx_slot = first_matching_slot_after(now, SlotFamily::Even, Mode::Ft8);
+        controller.on_full_decode(
+            rx_slot,
+            &[directed_decode(
+                "K1ABC",
+                "N1VF",
+                ToUsEvent::FieldDayExchange {
+                    acknowledge: false,
+                    exchange: FieldDayExchange::new(2, 'A', "WWA".to_string()),
+                },
+            )],
+            rx_slot,
+        );
+        assert_eq!(controller.snapshot(now).state, "send_sig_ack");
+    }
+
+    #[test]
+    fn field_day_received_ack_exchange_transitions_to_rr73_and_confirms_outcome() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        enable_field_day(&mut controller);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Odd)),
+            now,
+        );
+        let first_tx_slot = first_matching_slot_after(now, SlotFamily::Even, Mode::Ft8);
+        controller.tick(tx_key_time_for_slot(first_tx_slot, Mode::Ft8));
+        controller.tick(tx_key_time_for_slot(first_tx_slot, Mode::Ft8));
+        let rx_slot = first_matching_slot_after(first_tx_slot, SlotFamily::Odd, Mode::Ft8);
+        controller.on_full_decode(
+            rx_slot,
+            &[directed_decode(
+                "K1ABC",
+                "N1VF",
+                ToUsEvent::FieldDayExchange {
+                    acknowledge: true,
+                    exchange: FieldDayExchange::new(2, 'A', "WWA".to_string()),
+                },
+            )],
+            rx_slot,
+        );
+        assert_eq!(controller.snapshot(now).state, "send_rr73");
+        let tx_slot = first_matching_slot_after(rx_slot, SlotFamily::Even, Mode::Ft8);
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft8));
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft8));
+        controller.on_full_decode(
+            first_matching_slot_after(tx_slot, SlotFamily::Odd, Mode::Ft8),
+            &[],
+            first_matching_slot_after(tx_slot, SlotFamily::Odd, Mode::Ft8),
+        );
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].exchange_mode, ExchangeMode::FieldDay);
+        assert!(outcomes[0].sent_fd_exchange);
+        assert_eq!(
+            outcomes[0]
+                .received_fd_exchange
+                .as_ref()
+                .map(FieldDayExchange::as_text),
+            Some("2A WWA".to_string())
+        );
+        assert_eq!(
+            outcomes[0].completion_confidence,
+            CompletionConfidence::Confirmed
+        );
     }
 
     #[test]
@@ -4152,6 +4857,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -4194,6 +4900,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -4219,6 +4926,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -4275,6 +4983,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -4346,6 +5055,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -4378,6 +5088,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -4422,6 +5133,7 @@ mod tests {
                     last_snr_db: -7,
                     last_text: Some("N1VF K2ABC FN20".to_string()),
                     last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             true,
@@ -4485,6 +5197,7 @@ mod tests {
                     last_snr_db: -7,
                     last_text: Some("N1VF K2ABC FN20".to_string()),
                     last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             true,
@@ -4541,6 +5254,7 @@ mod tests {
                     last_snr_db: -7,
                     last_text: Some("N1VF K2ABC FN20".to_string()),
                     last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             true,
@@ -4554,6 +5268,7 @@ mod tests {
                 last_snr_db: -3,
                 last_text: Some("N1VF K2ABC FN20".to_string()),
                 last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                received_fd_exchange: None,
             },
             rx_slot_start + Duration::from_secs(16),
         ));
@@ -4598,6 +5313,7 @@ mod tests {
                     last_snr_db: -11,
                     last_text: Some("N1VF K2ABC FN20".to_string()),
                     last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             true,
@@ -4623,6 +5339,7 @@ mod tests {
                 last_snr_db: -3,
                 last_text: Some("N1VF K2ABC FN20".to_string()),
                 last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                received_fd_exchange: None,
             },
             launch_time + Duration::from_secs(1),
         ));
@@ -4684,6 +5401,7 @@ mod tests {
                     last_snr_db: -11,
                     last_text: Some("N1VF K2ABC FN20".to_string()),
                     last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             true,
@@ -4712,6 +5430,7 @@ mod tests {
                 last_snr_db: -3,
                 last_text: Some("N1VF K2ABC FN20".to_string()),
                 last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                received_fd_exchange: None,
             },
             launch_time + Duration::from_secs(1),
         ));
@@ -4951,6 +5670,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5270,6 +5990,7 @@ mod tests {
                     last_snr_db: -11,
                     last_text: Some("N1VF K2ABC FN20".to_string()),
                     last_structured_json: Some("{\"kind\":\"grid\"}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             false,
@@ -5377,6 +6098,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5415,6 +6137,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5446,6 +6169,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5476,6 +6200,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5504,6 +6229,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5533,6 +6259,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5564,6 +6291,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5592,6 +6320,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5620,6 +6349,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5642,6 +6372,10 @@ mod tests {
             partner_call: "K1ABC".to_string(),
             state: QsoState::SendGrid,
             start_mode: QsoStartMode::Normal,
+            exchange_mode: ExchangeMode::Normal,
+            field_day_mode_active: false,
+            field_day_only: true,
+            field_day_exchange: FieldDayExchange::new(1, 'E', "SCV".to_string()),
             tx_slot_family: SlotFamily::Even,
             tx_freq_hz: 1000.0,
             latest_partner_snr_db: -9,
@@ -5669,6 +6403,8 @@ mod tests {
             provisional_rx_decision: None,
             transcript: VecDeque::new(),
             sent_terminal_73: false,
+            sent_fd_exchange: false,
+            received_fd_exchange: None,
         };
         let rescheduled =
             schedule_next_tx_slot(&session, SystemTime::UNIX_EPOCH + Duration::from_secs(15))
@@ -5696,6 +6432,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5757,6 +6494,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -5866,6 +6604,7 @@ mod tests {
                 last_snr_db: -9,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );

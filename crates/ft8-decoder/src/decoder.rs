@@ -1556,6 +1556,15 @@ mod tests {
                 base_freq_hz: 650.0,
             },
             Case {
+                message: TxMessage::CqToken {
+                    token: "CQ FD".to_string(),
+                    my_call: "K1ABC".to_string(),
+                    my_grid: Some("FN31".to_string()),
+                },
+                expected: "CQ FD K1ABC FN31",
+                base_freq_hz: 775.0,
+            },
+            Case {
                 message: TxMessage::Directed {
                     peer_call: "W1XYZ".to_string(),
                     my_call: "K1ABC".to_string(),
