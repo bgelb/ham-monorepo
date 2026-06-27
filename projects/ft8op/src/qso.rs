@@ -321,6 +321,10 @@ impl QsoController {
         self.field_day_exchange = exchange;
     }
 
+    pub fn set_answer_attempts(&mut self, attempts: u32) {
+        self.config.fsm.send_grid.no_msg = attempts.clamp(1, 3);
+    }
+
     fn current_exchange_mode(&self) -> ExchangeMode {
         if self.field_day_mode_active && self.current_app_mode == Mode::Ft8 {
             ExchangeMode::FieldDay

@@ -273,6 +273,9 @@ enum QueueCommand {
     SetCqPauseMinUniqueCalls5m {
         count: u32,
     },
+    SetAnswerAttempts {
+        attempts: u32,
+    },
     SetFieldDayEnabled {
         enabled: bool,
     },
@@ -500,6 +503,11 @@ struct QueueCountRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueueAttemptsRequest {
+    attempts: u32,
+}
+
+#[derive(Debug, Deserialize)]
 struct QueueFieldDayExchangeRequest {
     transmitter_count: u8,
     class: String,
@@ -556,6 +564,7 @@ struct WebQueueSnapshot {
     pause_cq_when_few_unique_calls: bool,
     cq_pause_min_unique_calls_5m: u32,
     unique_calls_last_5m: u32,
+    answer_attempts: u32,
     field_day_enabled: bool,
     field_day_only: bool,
     field_day_transmitter_count: u8,
@@ -619,7 +628,9 @@ struct CompletedQsoRecord {
     field_day_mode_active: bool,
     field_day_only: bool,
     sent_exchange: String,
+    sent_transmitter_count: Option<u8>,
     received_exchange: String,
+    received_transmitter_count: Option<u8>,
     received_class: String,
     received_section: String,
     contest_exchange_received: bool,
@@ -708,6 +719,7 @@ struct WorkQueueState {
     cq_percent: u8,
     pause_cq_when_few_unique_calls: bool,
     cq_pause_min_unique_calls_5m: u32,
+    answer_attempts: u32,
     field_day_enabled: bool,
     field_day_only: bool,
     field_day_exchange: qso::FieldDayExchange,
@@ -913,6 +925,7 @@ impl WorkQueueState {
             cq_percent: config.queue.cq_percent_default.min(100),
             pause_cq_when_few_unique_calls: config.queue.pause_cq_when_few_unique_calls_default,
             cq_pause_min_unique_calls_5m: config.queue.cq_pause_min_unique_calls_5m_default,
+            answer_attempts: config.fsm.send_grid.no_msg.clamp(1, 3),
             field_day_enabled: config.field_day.enabled_default,
             field_day_only: config.field_day.fd_only_default,
             field_day_exchange: qso::FieldDayExchange::new(
@@ -1196,6 +1209,14 @@ impl WorkQueueState {
         info!(
             min_unique_calls_5m = self.cq_pause_min_unique_calls_5m,
             "queue_cq_low_activity_threshold_changed"
+        );
+    }
+
+    fn set_answer_attempts(&mut self, attempts: u32) {
+        self.answer_attempts = attempts.clamp(1, 3);
+        info!(
+            answer_attempts = self.answer_attempts,
+            "queue_answer_attempts_changed"
         );
     }
 
@@ -1577,6 +1598,7 @@ impl WorkQueueState {
             pause_cq_when_few_unique_calls: self.pause_cq_when_few_unique_calls,
             cq_pause_min_unique_calls_5m: self.cq_pause_min_unique_calls_5m,
             unique_calls_last_5m,
+            answer_attempts: self.answer_attempts,
             field_day_enabled: self.field_day_enabled,
             field_day_only: self.field_day_only,
             field_day_transmitter_count: self.field_day_exchange.transmitter_count,
@@ -2263,7 +2285,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .second-row {
       display: grid;
-      grid-template-columns: repeat(2, minmax(320px, 1fr));
+      grid-template-columns: minmax(760px, 1.35fr) minmax(360px, 0.65fr);
       gap: 16px;
       align-items: start;
     }
@@ -2442,10 +2464,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .detail-panel {
       height: 740px;
     }
-    .queue-panel,
-    .qso-panel {
-      height: 760px;
-    }
+    .queue-panel { height: 860px; }
+    .qso-panel { height: 760px; }
     .queue-panel {
       display: grid;
       grid-template-rows: auto auto auto auto minmax(0, 1fr);
@@ -2613,6 +2633,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .control-inline.dual {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+    .queue-control-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+      gap: 8px;
+      align-items: end;
+    }
+    .queue-control-grid .input-wrap {
+      min-width: 0;
+    }
+    .queue-control-grid .button {
+      min-height: 40px;
+      white-space: normal;
+      line-height: 1.15;
+    }
+    .queue-toggle-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 8px 14px;
+      margin-top: 8px;
+    }
     .input-wrap {
       display: grid;
       gap: 4px;
@@ -2737,6 +2777,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       gap: 8px;
       color: var(--ink);
       font-size: 13px;
+      line-height: 1.25;
+      min-width: 0;
+    }
+    .toggle-row input {
+      flex: 0 0 auto;
     }
     .queue-list {
       margin-top: 0;
@@ -2983,7 +3028,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
         <div class="detail-block">
           <div class="label">Queue Controls</div>
-          <div class="control-inline">
+          <div class="queue-control-grid">
             <div class="input-wrap">
               <div class="label">No Message Retry Delay</div>
               <input id="queue-no-message-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
@@ -3017,6 +3062,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <input id="queue-cq-min-unique-calls-5m" class="control-input" type="number" min="0" max="1000" step="1">
             </div>
             <div class="input-wrap">
+              <div class="label">Answer Attempts</div>
+              <select id="queue-answer-attempts" class="control-input">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+              </select>
+            </div>
+            <div class="input-wrap">
               <div class="label">5m Unique Now</div>
               <div class="value small" id="queue-unique-calls-last-5m">0</div>
             </div>
@@ -3035,7 +3088,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <button id="queue-next-cq-parity" class="button secondary" type="button">Flip Next CQ Parity</button>
             <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
           </div>
-        <div class="control-row">
+        <div class="queue-toggle-grid">
           <label class="toggle-row"><input id="queue-field-day-enabled" type="checkbox"> Field Day mode</label>
           <label class="toggle-row"><input id="queue-field-day-only" type="checkbox"> FD-only automation</label>
           <label class="toggle-row"><input id="queue-auto-add-decoded" type="checkbox"> Auto add eligible decodes</label>
@@ -3414,6 +3467,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateQueueCqMinUniqueCalls5m(count) {
       await postJson('/api/queue/cq-min-unique-calls-5m', { count });
+      scheduleRefresh(10);
+    }
+    async function updateQueueAnswerAttempts(attempts) {
+      await postJson('/api/queue/answer-attempts', { attempts });
       scheduleRefresh(10);
     }
     async function updateQueueFieldDayEnabled(enabled) {
@@ -3816,6 +3873,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const cqEnabled = document.getElementById('queue-cq-enabled');
       const pauseCqLowActivity = document.getElementById('queue-pause-cq-low-activity');
       const cqMinUniqueCalls5m = document.getElementById('queue-cq-min-unique-calls-5m');
+      const answerAttempts = document.getElementById('queue-answer-attempts');
       const uniqueCallsLast5m = document.getElementById('queue-unique-calls-last-5m');
       const compoundRr73 = document.getElementById('queue-compound-rr73');
       const compound73Once = document.getElementById('queue-compound-73-once');
@@ -3856,6 +3914,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       compound73Once.disabled = !!queue.field_day_enabled;
       compoundDirectSignal.disabled = !!queue.field_day_enabled;
       cqPercent.value = String(queue.cq_percent ?? 80);
+      answerAttempts.value = String(queue.answer_attempts ?? 3);
       uniqueCallsLast5m.textContent = String(queue.unique_calls_last_5m ?? 0);
       nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
       if (
@@ -4182,6 +4241,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       updateQueueAutoAddDecodedMinCount5m(Math.round(value)).catch((error) => console.error(error));
     });
+    document.getElementById('queue-answer-attempts').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (![1, 2, 3].includes(value)) {
+        if (lastSnapshot) renderQueue(lastSnapshot);
+        return;
+      }
+      updateQueueAnswerAttempts(value).catch((error) => console.error(error));
+    });
     document.getElementById('queue-auto-add-direct').addEventListener('change', (event) => {
       updateQueueAutoAddDirect(event.currentTarget.checked).catch((error) => console.error(error));
     });
@@ -4310,6 +4377,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route(
                     "/api/queue/cq-min-unique-calls-5m",
                     post(api_queue_cq_min_unique_calls_5m_handler),
+                )
+                .route(
+                    "/api/queue/answer-attempts",
+                    post(api_queue_answer_attempts_handler),
                 )
                 .route(
                     "/api/queue/field-day-enabled",
@@ -4625,6 +4696,33 @@ async fn api_queue_cq_min_unique_calls_5m_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue cq 5m unique threshold updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_answer_attempts_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueAttemptsRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    if !(1..=3).contains(&request.attempts) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "answer attempts must be 1, 2, or 3".to_string(),
+            }),
+        );
+    }
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetAnswerAttempts {
+            attempts: request.attempts,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue answer attempts updated".to_string(),
         }),
     )
 }
@@ -5181,11 +5279,16 @@ fn maybe_append_completed_qso_jsonl(config: &AppConfig, outcome: &QsoOutcome) {
         field_day_mode_active: outcome.field_day_mode_active,
         field_day_only: outcome.field_day_only,
         sent_exchange: outcome.sent_fd_exchange_text.clone(),
+        sent_transmitter_count: fd_exchange_transmitter_count(&outcome.sent_fd_exchange_text),
         received_exchange: outcome
             .received_fd_exchange
             .as_ref()
             .map(qso::FieldDayExchange::as_text)
             .unwrap_or_default(),
+        received_transmitter_count: outcome
+            .received_fd_exchange
+            .as_ref()
+            .map(|exchange| exchange.transmitter_count),
         received_class: outcome
             .received_fd_exchange
             .as_ref()
@@ -5219,6 +5322,19 @@ fn maybe_append_completed_qso_jsonl(config: &AppConfig, outcome: &QsoOutcome) {
     if let Err(error) = writeln!(file, "{line}") {
         warn!(path = %path.display(), %error, "completed_qso_log_write_failed");
     }
+}
+
+fn fd_exchange_transmitter_count(exchange: &str) -> Option<u8> {
+    let designator = exchange.split_whitespace().next()?.trim().to_uppercase();
+    let class = designator.chars().last()?;
+    if !matches!(class, 'A'..='F') {
+        return None;
+    }
+    let digits = &designator[..designator.len().saturating_sub(class.len_utf8())];
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u8>().ok()
 }
 
 fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTime) -> QsoJsonlScan {
@@ -5291,6 +5407,11 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             .and_then(|value| value.as_str())
             .map(parse_exchange_mode)
             .unwrap_or(qso::ExchangeMode::Normal);
+        let received_fd_exchange = fields
+            .get("received_fd_exchange")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
         let key = if event == "start" {
             let key = QsoHistoryKey {
                 session_id,
@@ -5390,7 +5511,13 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         {
             push_unique_info(&mut session.sent_infos, info);
         }
-        if let Some(info) = extract_exchange_info(rx_text) {
+        if !received_fd_exchange.is_empty() {
+            push_unique_info(&mut session.received_infos, received_fd_exchange.to_string());
+        } else if exchange_mode == qso::ExchangeMode::FieldDay {
+            if let Some(info) = extract_field_day_exchange_info(rx_text) {
+                push_unique_info(&mut session.received_infos, info);
+            }
+        } else if let Some(info) = extract_exchange_info(rx_text) {
             push_unique_info(&mut session.received_infos, info);
         }
     }
@@ -5447,17 +5574,40 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
 }
 
 fn extract_exchange_info(text: &str) -> Option<String> {
-    let mut parts = text.split_whitespace();
-    let _first = parts.next()?;
-    let _second = parts.next()?;
-    let info = parts.next()?.trim().to_uppercase();
+    let parts = text
+        .split_whitespace()
+        .map(|part| part.trim().to_uppercase())
+        .collect::<Vec<_>>();
+    if let Some(exchange) = extract_field_day_exchange_info_from_parts(&parts) {
+        return Some(exchange);
+    }
+    let info = parts.get(2)?.as_str();
     if info.is_empty() {
         return None;
     }
-    if matches!(info.as_str(), "73" | "RR73" | "RRR") {
+    if matches!(info, "73" | "RR73" | "RRR") {
         return None;
     }
-    Some(info)
+    Some(info.to_string())
+}
+
+fn extract_field_day_exchange_info(text: &str) -> Option<String> {
+    let parts = text
+        .split_whitespace()
+        .map(|part| part.trim().to_uppercase())
+        .collect::<Vec<_>>();
+    extract_field_day_exchange_info_from_parts(&parts)
+}
+
+fn extract_field_day_exchange_info_from_parts(parts: &[String]) -> Option<String> {
+    let info = parts.get(2)?.as_str();
+    if parts.len() >= 5 && info == "R" && is_field_day_exchange_designator(&parts[3]) {
+        return Some(format!("{} {}", parts[3], parts[4]));
+    }
+    if parts.len() >= 4 && is_field_day_exchange_designator(info) {
+        return Some(format!("{} {}", info, parts[3]));
+    }
+    None
 }
 
 fn extract_tx_exchange_info(
@@ -5508,6 +5658,17 @@ fn push_unique_info(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
     }
+}
+
+fn is_field_day_exchange_designator(value: &str) -> bool {
+    let Some(class) = value.chars().last() else {
+        return false;
+    };
+    if !matches!(class, 'A'..='F') {
+        return false;
+    }
+    let digits = &value[..value.len().saturating_sub(class.len_utf8())];
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_exchange_mode(value: &str) -> qso::ExchangeMode {
@@ -5631,6 +5792,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         work_queue.field_day_only,
         work_queue.field_day_exchange.clone(),
     );
+    qso_controller.set_answer_attempts(work_queue.answer_attempts);
     let web_snapshot = Arc::new(Mutex::new(WebSnapshot {
         qso_defaults: qso_controller.defaults(),
         qso: qso_controller.snapshot(SystemTime::now()),
@@ -5846,6 +6008,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QueueCommand::SetCqPauseMinUniqueCalls5m { count } => {
                     work_queue.set_cq_pause_min_unique_calls_5m(count)
                 }
+                QueueCommand::SetAnswerAttempts { attempts } => {
+                    work_queue.set_answer_attempts(attempts)
+                }
                 QueueCommand::SetFieldDayEnabled { enabled } => {
                     work_queue.set_field_day_enabled(enabled)
                 }
@@ -5872,6 +6037,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
             work_queue.field_day_only,
             work_queue.field_day_exchange.clone(),
         );
+        qso_controller.set_answer_attempts(work_queue.answer_attempts);
         for command in rig_control.drain() {
             match command {
                 RigCommand::Configure {
@@ -8981,10 +9147,7 @@ fn maybe_auto_add_decoded_calls(
     let mut callsigns = BTreeSet::new();
     let since = now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now);
     for decode in decodes {
-        if work_queue.field_day_enabled
-            && work_queue.field_day_only
-            && !is_field_day_auto_add_candidate(&decode.message)
-        {
+        if work_queue.field_day_enabled && !is_field_day_auto_add_candidate(&decode.message) {
             continue;
         }
         let Some(callsign) = semantic_sender_call(&decode.message) else {
@@ -9563,6 +9726,26 @@ mod tests {
         let message = StructuredMessage::Standard {
             i3: 0,
             first: token_call("CQ"),
+            second: standard_call(from),
+            acknowledge: false,
+            info: grid_info("FN20"),
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
+    fn cq_fd_decode(from: &str) -> DecodedMessage {
+        let message = StructuredMessage::Standard {
+            i3: 0,
+            first: token_call("CQ FD"),
             second: standard_call(from),
             acknowledge: false,
             info: grid_info("FN20"),
@@ -10802,6 +10985,33 @@ mod tests {
     }
 
     #[test]
+    fn auto_add_decoded_calls_restricts_to_field_day_candidates_in_fd_mode() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
+        queue.set_auto_add_all_decoded_calls(true);
+        queue.set_auto_add_decoded_min_count_5m(1);
+        queue.set_field_day_enabled(true);
+        queue.set_field_day_only(false);
+        let mut tracker = StationTracker::default();
+        let controller = qso::QsoController::new(config, Box::new(NoopTxBackend));
+
+        let normal = cq_decode("NORMAL");
+        let fd = cq_fd_decode("FDCALL");
+        tracker.ingest_frame(now, &[normal.clone(), fd.clone()]);
+
+        maybe_auto_add_decoded_calls(&mut queue, &tracker, &controller, &[normal, fd], now);
+
+        let calls = queue
+            .entries
+            .iter()
+            .map(|entry| entry.callsign.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec!["FDCALL".to_string()]);
+    }
+
+    #[test]
     fn auto_add_decoded_calls_requires_repeat_count_within_5m() {
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
@@ -11146,6 +11356,36 @@ mod tests {
     }
 
     #[test]
+    fn qso_jsonl_scan_surfaces_field_day_exchange_info() {
+        let contents = r#"{"timestamp":"2026-06-27T18:32:42Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":1,"partner_call":"W6SJC","state_before":"idle","state_after":"send_grid","last_rx_event":"start","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","rx_text":"CQ FD W6SJC CM97","tx_text":""}}
+{"timestamp":"2026-06-27T18:32:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":1,"partner_call":"W6SJC","state_before":"send_grid","state_after":"send_grid","last_rx_event":"noncall_first_field","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","sent_fd_exchange":true,"rx_text":"","tx_text":"W6SJC N1VF 1E SCV"}}
+{"timestamp":"2026-06-27T18:33:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_full","session_id":1,"partner_call":"W6SJC","state_before":"send_grid","state_after":"send_rr73","last_rx_event":"to_us_fd_exchange_ack","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","received_fd_exchange":"4F SCV","received_fd_class":"F","received_fd_section":"SCV","contest_exchange_received":true,"rx_text":"N1VF W6SJC R 4F SCV","tx_text":""}}
+{"timestamp":"2026-06-27T18:33:44Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":1,"partner_call":"W6SJC","state_before":"send_rr73","state_after":"idle","last_rx_event":"send_rr73_confirmed","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","received_fd_exchange":"4F SCV","received_fd_class":"F","received_fd_section":"SCV","contest_exchange_received":true,"rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 1);
+        assert_eq!(scan.history[0].callsign, "W6SJC");
+        assert_eq!(scan.history[0].sent_info, "1E SCV");
+        assert_eq!(scan.history[0].received_info, "4F SCV");
+    }
+
+    #[test]
+    fn exchange_info_parses_field_day_exchange_text() {
+        assert_eq!(
+            extract_exchange_info("N1VF W6SJC R 4F SCV").as_deref(),
+            Some("4F SCV")
+        );
+        assert_eq!(
+            extract_exchange_info("W6SJC N1VF 1E SCV").as_deref(),
+            Some("1E SCV")
+        );
+        assert_eq!(
+            extract_exchange_info("N1VF W6SJC R-07").as_deref(),
+            Some("R-07")
+        );
+    }
+
+    #[test]
     fn completed_qso_jsonl_appends_field_day_record() {
         let mut config = sample_app_config();
         let path =
@@ -11177,7 +11417,9 @@ mod tests {
         let contents = std::fs::read_to_string(&path).expect("completed qso jsonl");
         assert!(contents.contains("\"call\":\"K1ABC\""));
         assert!(contents.contains("\"sent_exchange\":\"1E SCV\""));
+        assert!(contents.contains("\"sent_transmitter_count\":1"));
         assert!(contents.contains("\"received_exchange\":\"2A WWA\""));
+        assert!(contents.contains("\"received_transmitter_count\":2"));
         let _ = std::fs::remove_file(path);
     }
 }
