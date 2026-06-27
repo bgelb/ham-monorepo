@@ -5439,6 +5439,8 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             });
         if session.partner_call.is_empty() {
             session.partner_call = partner_call.to_string();
+        } else if session.partner_call == "CQ" && partner_call != "CQ" {
+            session.partner_call = partner_call.to_string();
         }
         if !rig_band.is_empty() && session.rig_band.is_none() {
             session.rig_band = Some(rig_band.to_string());
@@ -5530,6 +5532,9 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                 .or(session.last_seen_at)
                 .or(session.started_at)?;
             let age = now.duration_since(time).unwrap_or_default();
+            if session.partner_call == "CQ" {
+                return None;
+            }
             Some((
                 time,
                 WebQsoHistoryEntry {
@@ -5616,6 +5621,13 @@ fn extract_tx_exchange_info(
     partner_call: &str,
     compound_next_call: &str,
 ) -> Option<String> {
+    if text
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("CQ"))
+    {
+        return None;
+    }
     if text.contains(" RR73; ") {
         if event == "compound_start"
             || (!compound_next_call.is_empty()
@@ -11287,6 +11299,31 @@ mod tests {
         assert_eq!(scan.history.len(), 1);
         assert_eq!(scan.history[0].callsign, "KJ7JJ");
         assert_eq!(scan.history[0].received_info, "DN17");
+    }
+
+    #[test]
+    fn qso_jsonl_scan_does_not_surface_unanswered_cq_as_qso() {
+        let contents = r#"{"timestamp":"2026-06-27T18:52:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":8,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"idle","state_after":"send_cq","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-06-27T18:52:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":8,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"none","rx_text":"","tx_text":"CQ FD N1VF CM97"}}
+{"timestamp":"2026-06-27T18:52:44Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":8,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"idle","last_rx_event":"send_cq_no_msg_limit","rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert!(scan.history.is_empty());
+    }
+
+    #[test]
+    fn qso_jsonl_scan_relabels_preempted_cq_to_real_caller() {
+        let contents = r#"{"timestamp":"2026-06-27T18:55:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":9,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"idle","state_after":"send_cq","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-06-27T18:55:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":9,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"none","rx_text":"","tx_text":"CQ FD N1VF CM97"}}
+{"timestamp":"2026-06-27T18:56:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_full","session_id":9,"partner_call":"KB5MAR","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"to_us_fd_exchange","received_fd_exchange":"3F NTX","received_fd_class":"F","received_fd_section":"NTX","contest_exchange_received":true,"rx_text":"N1VF KB5MAR 3F NTX","tx_text":""}}
+{"timestamp":"2026-06-27T18:56:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":9,"partner_call":"KB5MAR","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"idle","last_rx_event":"send_cq_direct_preempt","received_fd_exchange":"3F NTX","received_fd_class":"F","received_fd_section":"NTX","contest_exchange_received":true,"rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 1);
+        assert_eq!(scan.history[0].callsign, "KB5MAR");
+        assert_eq!(scan.history[0].sent_info, "-");
+        assert_eq!(scan.history[0].received_info, "3F NTX");
+        assert_eq!(scan.history[0].exit_reason, "send_cq_direct_preempt");
     }
 
     #[test]
