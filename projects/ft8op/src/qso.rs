@@ -271,6 +271,7 @@ pub struct QsoController {
     backend: Box<dyn TxBackend>,
     field_day_mode_active: bool,
     field_day_only: bool,
+    field_day_preempt_73_after_rr73: bool,
     field_day_exchange: FieldDayExchange,
     next_session_id: u64,
     session: Option<ActiveSession>,
@@ -296,6 +297,7 @@ impl QsoController {
         Self {
             field_day_mode_active: config.field_day.enabled_default,
             field_day_only: config.field_day.fd_only_default,
+            field_day_preempt_73_after_rr73: config.field_day.preempt_73_after_rr73_default,
             field_day_exchange,
             config,
             backend,
@@ -314,10 +316,12 @@ impl QsoController {
         &mut self,
         enabled: bool,
         fd_only: bool,
+        preempt_73_after_rr73: bool,
         exchange: FieldDayExchange,
     ) {
         self.field_day_mode_active = enabled;
         self.field_day_only = fd_only;
+        self.field_day_preempt_73_after_rr73 = preempt_73_after_rr73;
         self.field_day_exchange = exchange;
     }
 
@@ -326,9 +330,7 @@ impl QsoController {
     }
 
     fn current_exchange_mode(&self) -> ExchangeMode {
-        if self.field_day_mode_active
-            && matches!(self.current_app_mode, Mode::Ft8 | Mode::Ft4)
-        {
+        if self.field_day_mode_active && matches!(self.current_app_mode, Mode::Ft8 | Mode::Ft4) {
             ExchangeMode::FieldDay
         } else {
             ExchangeMode::Normal
@@ -416,6 +418,7 @@ impl QsoController {
         priority_direct_available: bool,
     ) -> DecodeStageOutcome {
         let mut outcome = DecodeStageOutcome::default();
+        let allow_fd_73_after_rr73_preempt = self.field_day_preempt_73_after_rr73;
         let Some(session) = &mut self.session else {
             return outcome;
         };
@@ -445,6 +448,7 @@ impl QsoController {
                 &event,
                 now,
                 priority_direct_available,
+                self.field_day_preempt_73_after_rr73,
             );
             return outcome;
         }
@@ -762,7 +766,9 @@ impl QsoController {
         }
 
         if priority_direct_available {
-            if let Some(reason) = Self::priority_direct_preempt_reason(session) {
+            if let Some(reason) =
+                Self::priority_direct_preempt_reason(session, allow_fd_73_after_rr73_preempt)
+            {
                 exit_reason = Some(reason);
                 outcome.priority_direct_preempted = true;
             }
@@ -1592,7 +1598,10 @@ impl QsoController {
         true
     }
 
-    fn priority_direct_preempt_reason(session: &ActiveSession) -> Option<&'static str> {
+    fn priority_direct_preempt_reason(
+        session: &ActiveSession,
+        allow_fd_73_after_rr73: bool,
+    ) -> Option<&'static str> {
         match (session.start_mode, session.state, session.partner_rx_count) {
             (QsoStartMode::Normal, QsoState::SendGrid, 0) => Some("send_grid_no_msg_limit"),
             (_, QsoState::SendSig, 0)
@@ -1601,8 +1610,25 @@ impl QsoController {
                 Some("send_sig_no_msg_limit")
             }
             (QsoStartMode::Cq, QsoState::SendCq, _) => Some("send_cq_direct_preempt"),
+            (_, QsoState::Send73Once, _)
+                if allow_fd_73_after_rr73
+                    && session.field_day_mode_active
+                    && session.exchange_mode.is_field_day()
+                    && session.sent_fd_exchange
+                    && session.received_fd_exchange.is_some()
+                    && session.last_rx_event.as_deref() == Some("to_us_reply_rr73") =>
+            {
+                Some("send_73_once_fd_rr73_direct_preempt")
+            }
             _ => None,
         }
+    }
+
+    fn priority_direct_preempt_reason_for_session(
+        &self,
+        session: &ActiveSession,
+    ) -> Option<&'static str> {
+        Self::priority_direct_preempt_reason(session, self.field_day_preempt_73_after_rr73)
     }
 
     #[cfg(test)]
@@ -1610,7 +1636,7 @@ impl QsoController {
         let Some(session) = &self.session else {
             return false;
         };
-        let reason = Self::priority_direct_preempt_reason(session);
+        let reason = self.priority_direct_preempt_reason_for_session(session);
         let Some(reason) = reason else {
             return false;
         };
@@ -2344,6 +2370,7 @@ impl QsoController {
         event: &PartnerEvent,
         now: SystemTime,
         priority_direct_available: bool,
+        allow_fd_73_after_rr73_preempt: bool,
     ) {
         if session.app_mode != Mode::Ft8 {
             return;
@@ -2363,6 +2390,7 @@ impl QsoController {
             stage,
             event,
             priority_direct_available,
+            allow_fd_73_after_rr73_preempt,
         );
         let exit_reason = transition.exit_reason;
         proposed.transcript = session.transcript.clone();
@@ -2411,6 +2439,7 @@ impl QsoController {
         stage: DecodeStage,
         event: &PartnerEvent,
         priority_direct_available: bool,
+        allow_fd_73_after_rr73_preempt: bool,
     ) -> RxTransitionOutcome {
         Self::roll_rx_stage_tracking(session, slot_start);
         session.compound_rr73_ready_slot = None;
@@ -2688,10 +2717,13 @@ impl QsoController {
             QsoState::Send73Once => {}
         }
 
-        let priority_direct_preempted =
-            priority_direct_available && Self::priority_direct_preempt_reason(session).is_some();
+        let priority_direct_preempted = priority_direct_available
+            && Self::priority_direct_preempt_reason(session, allow_fd_73_after_rr73_preempt)
+                .is_some();
         if priority_direct_preempted {
-            exit_reason = Self::priority_direct_preempt_reason(session).map(str::to_string);
+            exit_reason =
+                Self::priority_direct_preempt_reason(session, allow_fd_73_after_rr73_preempt)
+                    .map(str::to_string);
         }
 
         if exit_reason.is_none() {
@@ -4716,6 +4748,7 @@ mod tests {
         controller.set_field_day_runtime(
             true,
             true,
+            true,
             FieldDayExchange::new(1, 'E', "SCV".to_string()),
         );
     }
@@ -4865,6 +4898,90 @@ mod tests {
             outcomes[0].completion_confidence,
             CompletionConfidence::Confirmed
         );
+    }
+
+    fn start_field_day_direct_waiting_for_rr73(controller: &mut QsoController, now: SystemTime) {
+        enable_field_day(controller);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "K1ABC".to_string(),
+                tx_freq_hz: 1000.0,
+                initial_state: QsoState::SendSigAck,
+                start_mode: QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Even),
+            },
+            Some(StationStartInfo {
+                callsign: "K1ABC".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Odd,
+                last_snr_db: -7,
+                last_text: Some("N1VF K1ABC 2A WWA".to_string()),
+                last_structured_json: None,
+                received_fd_exchange: Some(FieldDayExchange::new(2, 'A', "WWA".to_string())),
+            }),
+            now,
+        );
+        let tx_slot = first_matching_slot_after(now, SlotFamily::Even, Mode::Ft8);
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft8));
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft8));
+        let rr73_slot = first_matching_slot_after(tx_slot, SlotFamily::Odd, Mode::Ft8);
+        controller.on_full_decode(
+            rr73_slot,
+            &[directed_decode(
+                "K1ABC",
+                "N1VF",
+                ToUsEvent::Reply(ReplyWord::Rr73),
+            )],
+            rr73_slot,
+        );
+        assert_eq!(controller.snapshot(now).state, "send_73_once");
+    }
+
+    #[test]
+    fn field_day_send_73_once_after_rr73_can_preempt_for_priority_direct() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        start_field_day_direct_waiting_for_rr73(&mut controller, now);
+
+        assert!(controller.preempt_for_priority_direct(now + Duration::from_secs(31)));
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].exit_reason,
+            "send_73_once_fd_rr73_direct_preempt"
+        );
+        assert!(!outcomes[0].sent_terminal_73);
+        assert!(outcomes[0].sent_fd_exchange);
+        assert_eq!(
+            outcomes[0]
+                .received_fd_exchange
+                .as_ref()
+                .map(FieldDayExchange::as_text),
+            Some("2A WWA".to_string())
+        );
+        assert_eq!(
+            outcomes[0].completion_confidence,
+            CompletionConfidence::Confirmed
+        );
+    }
+
+    #[test]
+    fn field_day_send_73_once_after_rr73_preempt_respects_runtime_toggle() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        start_field_day_direct_waiting_for_rr73(&mut controller, now);
+        controller.set_field_day_runtime(
+            true,
+            true,
+            false,
+            FieldDayExchange::new(1, 'E', "SCV".to_string()),
+        );
+
+        assert!(!controller.preempt_for_priority_direct(now + Duration::from_secs(31)));
+        assert_eq!(controller.snapshot(now).state, "send_73_once");
+        assert!(controller.drain_outcomes().is_empty());
     }
 
     #[test]

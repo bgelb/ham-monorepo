@@ -95,6 +95,8 @@ pub struct FieldDayConfig {
     pub enabled_default: bool,
     #[serde(default = "default_true")]
     pub fd_only_default: bool,
+    #[serde(default = "default_true")]
+    pub preempt_73_after_rr73_default: bool,
     #[serde(default = "default_fd_transmitter_count")]
     pub transmitter_count: u8,
     #[serde(default = "default_fd_class")]
@@ -110,6 +112,7 @@ impl Default for FieldDayConfig {
         Self {
             enabled_default: false,
             fd_only_default: true,
+            preempt_73_after_rr73_default: true,
             transmitter_count: default_fd_transmitter_count(),
             class: default_fd_class(),
             section: default_fd_section(),

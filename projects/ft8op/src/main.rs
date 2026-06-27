@@ -282,6 +282,9 @@ enum QueueCommand {
     SetFieldDayOnly {
         enabled: bool,
     },
+    SetFieldDayPreempt73AfterRr73 {
+        enabled: bool,
+    },
     SetFieldDayExchange {
         transmitter_count: u8,
         class: char,
@@ -567,6 +570,7 @@ struct WebQueueSnapshot {
     answer_attempts: u32,
     field_day_enabled: bool,
     field_day_only: bool,
+    field_day_preempt_73_after_rr73: bool,
     field_day_transmitter_count: u8,
     field_day_class: String,
     field_day_section: String,
@@ -722,6 +726,7 @@ struct WorkQueueState {
     answer_attempts: u32,
     field_day_enabled: bool,
     field_day_only: bool,
+    field_day_preempt_73_after_rr73: bool,
     field_day_exchange: qso::FieldDayExchange,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
@@ -928,6 +933,7 @@ impl WorkQueueState {
             answer_attempts: config.fsm.send_grid.no_msg.clamp(1, 3),
             field_day_enabled: config.field_day.enabled_default,
             field_day_only: config.field_day.fd_only_default,
+            field_day_preempt_73_after_rr73: config.field_day.preempt_73_after_rr73_default,
             field_day_exchange: qso::FieldDayExchange::new(
                 config.field_day.transmitter_count,
                 config.field_day.class,
@@ -1230,6 +1236,11 @@ impl WorkQueueState {
         info!(enabled, "queue_field_day_only_changed");
     }
 
+    fn set_field_day_preempt_73_after_rr73(&mut self, enabled: bool) {
+        self.field_day_preempt_73_after_rr73 = enabled;
+        info!(enabled, "queue_field_day_preempt_73_after_rr73_changed");
+    }
+
     fn set_field_day_exchange(&mut self, transmitter_count: u8, class: char, section: String) {
         self.field_day_exchange = qso::FieldDayExchange::new(transmitter_count, class, section);
         info!(
@@ -1239,7 +1250,8 @@ impl WorkQueueState {
     }
 
     fn exchange_mode(&self) -> qso::ExchangeMode {
-        if self.field_day_enabled && matches!(self.current_mode, DecoderMode::Ft8 | DecoderMode::Ft4)
+        if self.field_day_enabled
+            && matches!(self.current_mode, DecoderMode::Ft8 | DecoderMode::Ft4)
         {
             qso::ExchangeMode::FieldDay
         } else {
@@ -1367,7 +1379,10 @@ impl WorkQueueState {
     }
 
     fn handle_qso_outcome(&mut self, outcome: &QsoOutcome, tracker: &StationTracker) {
-        if outcome.sent_terminal_73 {
+        let loggable_field_day_completion = outcome.exchange_mode == qso::ExchangeMode::FieldDay
+            && outcome.field_day_mode_active
+            && outcome.completion_confidence != qso::CompletionConfidence::Insufficient;
+        if outcome.sent_terminal_73 || loggable_field_day_completion {
             if let Some(band) = outcome.rig_band.as_deref() {
                 self.mark_worked(
                     &outcome.partner_call,
@@ -1602,6 +1617,7 @@ impl WorkQueueState {
             answer_attempts: self.answer_attempts,
             field_day_enabled: self.field_day_enabled,
             field_day_only: self.field_day_only,
+            field_day_preempt_73_after_rr73: self.field_day_preempt_73_after_rr73,
             field_day_transmitter_count: self.field_day_exchange.transmitter_count,
             field_day_class: self.field_day_exchange.class.to_string(),
             field_day_section: self.field_day_exchange.section.clone(),
@@ -3092,6 +3108,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="queue-toggle-grid">
           <label class="toggle-row"><input id="queue-field-day-enabled" type="checkbox"> Field Day mode</label>
           <label class="toggle-row"><input id="queue-field-day-only" type="checkbox"> FD-only automation</label>
+          <label class="toggle-row"><input id="queue-field-day-preempt-73-after-rr73" type="checkbox"> FD skip final 73 for active caller</label>
           <label class="toggle-row"><input id="queue-auto-add-decoded" type="checkbox"> Auto add eligible decodes</label>
           <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
           <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
@@ -3482,6 +3499,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/field-day-only', { enabled });
       scheduleRefresh(10);
     }
+    async function updateQueueFieldDayPreempt73AfterRr73(enabled) {
+      await postJson('/api/queue/field-day-preempt-73-after-rr73', { enabled });
+      scheduleRefresh(10);
+    }
     async function updateQueueFieldDayExchange(transmitterCount, fdClass, section) {
       await postJson('/api/queue/field-day-exchange', {
         transmitter_count: transmitterCount,
@@ -3868,6 +3889,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
       const fieldDayEnabled = document.getElementById('queue-field-day-enabled');
       const fieldDayOnly = document.getElementById('queue-field-day-only');
+      const fieldDayPreempt73AfterRr73 = document.getElementById('queue-field-day-preempt-73-after-rr73');
       const fieldDayTxCount = document.getElementById('queue-fd-tx-count');
       const fieldDayClass = document.getElementById('queue-fd-class');
       const fieldDaySection = document.getElementById('queue-fd-section');
@@ -3897,6 +3919,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
       ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
       fieldDayEnabled.checked = !!queue.field_day_enabled;
       fieldDayOnly.checked = !!queue.field_day_only;
+      fieldDayPreempt73AfterRr73.checked = !!queue.field_day_preempt_73_after_rr73;
+      fieldDayPreempt73AfterRr73.disabled = !queue.field_day_enabled;
       if (fieldDayTxCount.value === '' || Number(fieldDayTxCount.value) !== Number(queue.field_day_transmitter_count)) {
         fieldDayTxCount.value = String(queue.field_day_transmitter_count ?? 1);
       }
@@ -4262,6 +4286,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-field-day-only').addEventListener('change', (event) => {
       updateQueueFieldDayOnly(event.currentTarget.checked).catch((error) => console.error(error));
     });
+    document.getElementById('queue-field-day-preempt-73-after-rr73').addEventListener('change', (event) => {
+      updateQueueFieldDayPreempt73AfterRr73(event.currentTarget.checked).catch((error) => console.error(error));
+    });
     function submitFieldDayExchange() {
       const txCount = Number(document.getElementById('queue-fd-tx-count').value);
       const fdClass = document.getElementById('queue-fd-class').value.trim().toUpperCase();
@@ -4390,6 +4417,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route(
                     "/api/queue/field-day-only",
                     post(api_queue_field_day_only_handler),
+                )
+                .route(
+                    "/api/queue/field-day-preempt-73-after-rr73",
+                    post(api_queue_field_day_preempt_73_after_rr73_handler),
                 )
                 .route(
                     "/api/queue/field-day-exchange",
@@ -4758,6 +4789,24 @@ async fn api_queue_field_day_only_handler(
         Json(ApiStatus {
             ok: true,
             message: "field day only updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_field_day_preempt_73_after_rr73_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetFieldDayPreempt73AfterRr73 {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "field day 73 preemption updated".to_string(),
         }),
     )
 }
@@ -5515,7 +5564,10 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             push_unique_info(&mut session.sent_infos, info);
         }
         if !received_fd_exchange.is_empty() {
-            push_unique_info(&mut session.received_infos, received_fd_exchange.to_string());
+            push_unique_info(
+                &mut session.received_infos,
+                received_fd_exchange.to_string(),
+            );
         } else if exchange_mode == qso::ExchangeMode::FieldDay {
             if let Some(info) = extract_field_day_exchange_info(rx_text) {
                 push_unique_info(&mut session.received_infos, info);
@@ -5806,6 +5858,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     qso_controller.set_field_day_runtime(
         work_queue.field_day_enabled,
         work_queue.field_day_only,
+        work_queue.field_day_preempt_73_after_rr73,
         work_queue.field_day_exchange.clone(),
     );
     qso_controller.set_answer_attempts(work_queue.answer_attempts);
@@ -6031,6 +6084,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                     work_queue.set_field_day_enabled(enabled)
                 }
                 QueueCommand::SetFieldDayOnly { enabled } => work_queue.set_field_day_only(enabled),
+                QueueCommand::SetFieldDayPreempt73AfterRr73 { enabled } => {
+                    work_queue.set_field_day_preempt_73_after_rr73(enabled)
+                }
                 QueueCommand::SetFieldDayExchange {
                     transmitter_count,
                     class,
@@ -6051,6 +6107,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         qso_controller.set_field_day_runtime(
             work_queue.field_day_enabled,
             work_queue.field_day_only,
+            work_queue.field_day_preempt_73_after_rr73,
             work_queue.field_day_exchange.clone(),
         );
         qso_controller.set_answer_attempts(work_queue.answer_attempts);

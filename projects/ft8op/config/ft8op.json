@@ -69,6 +69,7 @@
   "field_day": {
     "enabled_default": false,
     "fd_only_default": true,
+    "preempt_73_after_rr73_default": true,
     "transmitter_count": 1,
     "class": "E",
     "section": "SCV",
