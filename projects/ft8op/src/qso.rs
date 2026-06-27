@@ -326,7 +326,9 @@ impl QsoController {
     }
 
     fn current_exchange_mode(&self) -> ExchangeMode {
-        if self.field_day_mode_active && self.current_app_mode == Mode::Ft8 {
+        if self.field_day_mode_active
+            && matches!(self.current_app_mode, Mode::Ft8 | Mode::Ft4)
+        {
             ExchangeMode::FieldDay
         } else {
             ExchangeMode::Normal
@@ -4738,6 +4740,44 @@ mod tests {
                 .transcript
                 .iter()
                 .any(|entry| entry.direction == "TX:" && entry.text == "K1ABC N1VF 1E SCV")
+        );
+    }
+
+    #[test]
+    fn field_day_ft4_direct_call_sends_ack_exchange() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        enable_field_day(&mut controller);
+        controller.update_rig_context(Some(14_080_000), Some("20m".to_string()), Mode::Ft4);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            QsoCommand::Start {
+                partner_call: "WB1BWQ".to_string(),
+                tx_freq_hz: 1000.0,
+                initial_state: QsoState::SendSigAck,
+                start_mode: QsoStartMode::Direct,
+                tx_slot_family_override: Some(SlotFamily::Odd),
+            },
+            Some(StationStartInfo {
+                callsign: "WB1BWQ".to_string(),
+                last_heard_at: now,
+                last_heard_slot_family: SlotFamily::Even,
+                last_snr_db: -1,
+                last_text: Some("N1VF WB1BWQ 1E WTX".to_string()),
+                last_structured_json: None,
+                received_fd_exchange: Some(FieldDayExchange::new(1, 'E', "WTX".to_string())),
+            }),
+            now,
+        );
+        let tx_slot = first_matching_slot_after(now, SlotFamily::Odd, Mode::Ft4);
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft4));
+        controller.tick(tx_key_time_for_slot(tx_slot, Mode::Ft4));
+        let snapshot = controller.snapshot(now);
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .any(|entry| entry.direction == "TX:" && entry.text == "WB1BWQ N1VF R 1E SCV")
         );
     }
 

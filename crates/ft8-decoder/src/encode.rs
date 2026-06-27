@@ -228,13 +228,9 @@ pub fn synthesize_tx_message(
             class,
             section,
         } => {
-            if options.mode != Mode::Ft8 {
-                return Err(EncodeError::UnsupportedModeFeature(
-                    "field-day messages are only wired for ft8 so far".to_string(),
-                ));
-            }
             (
-                encode_field_day_message(
+                encode_field_day_message_for_mode(
+                    options.mode,
                     first_call,
                     second_call,
                     *acknowledge,
@@ -378,6 +374,26 @@ pub fn encode_field_day_message(
     class: char,
     section: &str,
 ) -> Result<EncodedFrame, EncodeError> {
+    encode_field_day_message_for_mode(
+        Mode::Ft8,
+        first_call,
+        second_call,
+        acknowledge,
+        transmitter_count,
+        class,
+        section,
+    )
+}
+
+pub fn encode_field_day_message_for_mode(
+    mode: Mode,
+    first_call: &str,
+    second_call: &str,
+    acknowledge: bool,
+    transmitter_count: u8,
+    class: char,
+    section: &str,
+) -> Result<EncodedFrame, EncodeError> {
     if !(1..=32).contains(&transmitter_count) {
         return Err(EncodeError::UnsupportedInfo(format!(
             "field day transmitters: {transmitter_count}"
@@ -432,7 +448,7 @@ pub fn encode_field_day_message(
     );
     write_bit_field(&mut message_bits, FTX_FIELD_DAY_LAYOUT.subtype, subtype);
     write_bit_field(&mut message_bits, FTX_FIELD_DAY_LAYOUT.kind, 0);
-    build_frame_for_mode(Mode::Ft8, message_bits)
+    build_frame_for_mode(mode, message_bits)
 }
 
 pub fn encode_rtty_contest_message(
@@ -1413,6 +1429,34 @@ mod tests {
         assert_eq!(
             audio.samples.len(),
             Mode::Ft4.spec().geometry.frame_samples()
+        );
+    }
+
+    #[test]
+    fn ft4_field_day_message_uses_ft4_geometry_and_round_trips() {
+        let synthesized = synthesize_tx_message(
+            &TxMessage::FieldDay {
+                first_call: "WB1BWQ".to_string(),
+                second_call: "N1VF".to_string(),
+                acknowledge: true,
+                transmitter_count: 1,
+                class: 'E',
+                section: "SCV".to_string(),
+            },
+            &WaveformOptions {
+                mode: Mode::Ft4,
+                base_freq_hz: 1_000.0,
+                ..WaveformOptions::for_mode(Mode::Ft4)
+            },
+        )
+        .expect("synthesize ft4 field day");
+        assert_eq!(synthesized.frame.mode, Mode::Ft4);
+        assert_eq!(synthesized.rendered_text, "WB1BWQ N1VF R 1E SCV");
+        let payload =
+            unpack_message_for_mode(Mode::Ft4, &synthesized.frame.codeword_bits).expect("payload");
+        assert_eq!(
+            payload.to_message(&HashResolver::default()).to_text(),
+            "WB1BWQ N1VF R 1E SCV"
         );
     }
 

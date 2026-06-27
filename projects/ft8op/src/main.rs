@@ -1239,7 +1239,8 @@ impl WorkQueueState {
     }
 
     fn exchange_mode(&self) -> qso::ExchangeMode {
-        if self.field_day_enabled && self.current_mode == DecoderMode::Ft8 {
+        if self.field_day_enabled && matches!(self.current_mode, DecoderMode::Ft8 | DecoderMode::Ft4)
+        {
             qso::ExchangeMode::FieldDay
         } else {
             qso::ExchangeMode::Normal
@@ -5532,6 +5533,9 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                 .or(session.last_seen_at)
                 .or(session.started_at)?;
             let age = now.duration_since(time).unwrap_or_default();
+            if session.exit_reason.as_deref() == Some("send_cq_direct_preempt") {
+                return None;
+            }
             if session.partner_call == "CQ" {
                 return None;
             }
@@ -10145,6 +10149,15 @@ mod tests {
     }
 
     #[test]
+    fn queue_exchange_mode_treats_ft4_as_field_day_when_enabled() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_mode(DecoderMode::Ft4);
+        queue.set_field_day_enabled(true);
+        assert_eq!(queue.exchange_mode(), qso::ExchangeMode::FieldDay);
+    }
+
+    #[test]
     fn ft4_slot_boundaries_preserve_half_second_alignment() {
         let before_half = UNIX_EPOCH + Duration::from_millis(7_499);
         let at_half = UNIX_EPOCH + Duration::from_millis(7_500);
@@ -11312,18 +11325,14 @@ mod tests {
     }
 
     #[test]
-    fn qso_jsonl_scan_relabels_preempted_cq_to_real_caller() {
+    fn qso_jsonl_scan_does_not_surface_preempted_cq_placeholder() {
         let contents = r#"{"timestamp":"2026-06-27T18:55:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":9,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"idle","state_after":"send_cq","last_rx_event":"start","rx_text":"","tx_text":""}}
 {"timestamp":"2026-06-27T18:55:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":9,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"none","rx_text":"","tx_text":"CQ FD N1VF CM97"}}
 {"timestamp":"2026-06-27T18:56:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_full","session_id":9,"partner_call":"KB5MAR","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"to_us_fd_exchange","received_fd_exchange":"3F NTX","received_fd_class":"F","received_fd_section":"NTX","contest_exchange_received":true,"rx_text":"N1VF KB5MAR 3F NTX","tx_text":""}}
 {"timestamp":"2026-06-27T18:56:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":9,"partner_call":"KB5MAR","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"idle","last_rx_event":"send_cq_direct_preempt","received_fd_exchange":"3F NTX","received_fd_class":"F","received_fd_section":"NTX","contest_exchange_received":true,"rx_text":"","tx_text":""}}"#;
         let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
         let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
-        assert_eq!(scan.history.len(), 1);
-        assert_eq!(scan.history[0].callsign, "KB5MAR");
-        assert_eq!(scan.history[0].sent_info, "-");
-        assert_eq!(scan.history[0].received_info, "3F NTX");
-        assert_eq!(scan.history[0].exit_reason, "send_cq_direct_preempt");
+        assert!(scan.history.is_empty());
     }
 
     #[test]
