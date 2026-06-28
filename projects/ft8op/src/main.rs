@@ -254,6 +254,9 @@ enum QueueCommand {
     SetAutoAddAllDecodedCalls {
         enabled: bool,
     },
+    SetAutoAddDecodedRequireFinishCount {
+        enabled: bool,
+    },
     SetAutoAddDecodedMinCount5m {
         count: u32,
     },
@@ -562,6 +565,7 @@ struct ApiStatus {
 struct WebQueueSnapshot {
     auto_enabled: bool,
     auto_add_all_decoded_calls: bool,
+    auto_add_decoded_require_finish_count: bool,
     auto_add_decoded_min_count_5m: u32,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
@@ -721,6 +725,7 @@ struct WorkQueueState {
     current_band: Option<String>,
     current_mode: DecoderMode,
     auto_add_all_decoded_calls: bool,
+    auto_add_decoded_require_finish_count: bool,
     auto_add_decoded_min_count_5m: u32,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
@@ -923,6 +928,7 @@ impl WorkQueueState {
             current_band: None,
             current_mode: DecoderMode::Ft8,
             auto_add_all_decoded_calls: config.queue.auto_add_all_decoded_calls_default,
+            auto_add_decoded_require_finish_count: false,
             auto_add_decoded_min_count_5m: config
                 .queue
                 .auto_add_decoded_min_count_5m_default
@@ -1183,6 +1189,14 @@ impl WorkQueueState {
     fn set_auto_add_all_decoded_calls(&mut self, enabled: bool) {
         self.auto_add_all_decoded_calls = enabled;
         info!(enabled, "queue_auto_add_all_decoded_changed");
+    }
+
+    fn set_auto_add_decoded_require_finish_count(&mut self, enabled: bool) {
+        self.auto_add_decoded_require_finish_count = enabled;
+        info!(
+            enabled,
+            "queue_auto_add_decoded_require_finish_count_changed"
+        );
     }
 
     fn set_auto_add_decoded_min_count_5m(&mut self, count: u32) {
@@ -1618,6 +1632,7 @@ impl WorkQueueState {
         WebQueueSnapshot {
             auto_enabled: self.auto_enabled,
             auto_add_all_decoded_calls: self.auto_add_all_decoded_calls,
+            auto_add_decoded_require_finish_count: self.auto_add_decoded_require_finish_count,
             auto_add_decoded_min_count_5m: self.auto_add_decoded_min_count_5m,
             auto_add_direct_calls: self.auto_add_direct_calls,
             ignore_direct_calls_from_recently_worked: self.ignore_direct_calls_from_recently_worked,
@@ -3157,6 +3172,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <label class="toggle-row"><input id="queue-field-day-only" type="checkbox"> FD-only automation</label>
           <label class="toggle-row"><input id="queue-field-day-preempt-73-after-rr73" type="checkbox"> FD skip final 73 for active caller</label>
           <label class="toggle-row"><input id="queue-auto-add-decoded" type="checkbox"> Auto add eligible decodes</label>
+          <label class="toggle-row"><input id="queue-auto-add-f10" type="checkbox"> Auto add only F10&gt;0</label>
           <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
           <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
           <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
@@ -3492,6 +3508,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateQueueAutoAddDecoded(enabled) {
       await postJson('/api/queue/auto-add-decoded', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueAutoAddF10(enabled) {
+      await postJson('/api/queue/auto-add-f10', { enabled });
       scheduleRefresh(10);
     }
     async function updateQueueAutoAddDecodedMinCount5m(count) {
@@ -3931,6 +3951,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const noMessageRetryDelay = document.getElementById('queue-no-message-retry-delay');
       const noForwardRetryDelay = document.getElementById('queue-no-forward-retry-delay');
       const autoAddDecoded = document.getElementById('queue-auto-add-decoded');
+      const autoAddF10 = document.getElementById('queue-auto-add-f10');
       const autoAddDecodedMinCount5m = document.getElementById('queue-auto-add-decoded-min-count-5m');
       const autoAddDirect = document.getElementById('queue-auto-add-direct');
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
@@ -3963,6 +3984,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
         autoAddDecodedMinCount5m.value = String(queue.auto_add_decoded_min_count_5m ?? 2);
       }
       autoAddDirect.checked = !!queue.auto_add_direct_calls;
+      autoAddF10.checked = !!queue.auto_add_decoded_require_finish_count;
+      autoAddF10.disabled = !queue.auto_add_all_decoded_calls;
       ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
       fieldDayEnabled.checked = !!queue.field_day_enabled;
       fieldDayOnly.checked = !!queue.field_day_only;
@@ -4307,6 +4330,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-auto-add-decoded').addEventListener('change', (event) => {
       updateQueueAutoAddDecoded(event.currentTarget.checked).catch((error) => console.error(error));
     });
+    document.getElementById('queue-auto-add-f10').addEventListener('change', (event) => {
+      updateQueueAutoAddF10(event.currentTarget.checked).catch((error) => console.error(error));
+    });
     document.getElementById('queue-auto-add-decoded-min-count-5m').addEventListener('change', (event) => {
       const value = Number(event.currentTarget.value);
       if (!Number.isFinite(value) || value < 1 || value > 1000) {
@@ -4432,6 +4458,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route(
                     "/api/queue/auto-add-decoded",
                     post(api_queue_auto_add_decoded_handler),
+                )
+                .route(
+                    "/api/queue/auto-add-f10",
+                    post(api_queue_auto_add_f10_handler),
                 )
                 .route(
                     "/api/queue/auto-add-decoded-min-count-5m",
@@ -4630,6 +4660,24 @@ async fn api_queue_auto_add_decoded_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue decoded auto-add updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_auto_add_f10_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetAutoAddDecodedRequireFinishCount {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue decoded F10 auto-add filter updated".to_string(),
         }),
     )
 }
@@ -6108,6 +6156,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 } => work_queue.set_retry_delay(kind, Duration::from_secs(retry_delay_seconds)),
                 QueueCommand::SetAutoAddAllDecodedCalls { enabled } => {
                     work_queue.set_auto_add_all_decoded_calls(enabled)
+                }
+                QueueCommand::SetAutoAddDecodedRequireFinishCount { enabled } => {
+                    work_queue.set_auto_add_decoded_require_finish_count(enabled)
                 }
                 QueueCommand::SetAutoAddDecodedMinCount5m { count } => {
                     work_queue.set_auto_add_decoded_min_count_5m(count)
@@ -9313,6 +9364,7 @@ fn maybe_auto_add_decoded_calls(
     let active_partner = qso_controller.active_partner_call();
     let mut callsigns = BTreeSet::new();
     let since = now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now);
+    let finish_count_since = now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now);
     for decode in decodes {
         if work_queue.field_day_enabled && !is_field_day_auto_add_candidate(&decode.message) {
             continue;
@@ -9328,6 +9380,12 @@ fn maybe_auto_add_decoded_calls(
     for callsign in callsigns {
         if station_tracker.sender_decode_count_since(since, &callsign)
             < work_queue.auto_add_decoded_min_count_5m as usize
+        {
+            continue;
+        }
+        if work_queue.auto_add_decoded_require_finish_count
+            && station_tracker.finish_reply_unique_peer_count_since(&callsign, finish_count_since)
+                == 0
         {
             continue;
         }
@@ -11330,6 +11388,48 @@ mod tests {
             .map(|entry| entry.callsign.clone())
             .collect::<Vec<_>>();
         assert_eq!(calls, vec!["ALPHA".to_string(), "BRAVO".to_string()]);
+    }
+
+    #[test]
+    fn auto_add_decoded_calls_can_require_finish_count() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
+        queue.set_auto_add_all_decoded_calls(true);
+        queue.set_auto_add_decoded_min_count_5m(1);
+        queue.set_auto_add_decoded_require_finish_count(true);
+        let mut tracker = StationTracker::default();
+        let controller = qso::QsoController::new(config, Box::new(NoopTxBackend));
+
+        let alpha = cq_decode("ALPHA");
+        tracker.ingest_frame(now, std::slice::from_ref(&alpha));
+        maybe_auto_add_decoded_calls(&mut queue, &tracker, &controller, &[alpha.clone()], now);
+        assert!(queue.entries.is_empty());
+
+        tracker.ingest_frame(
+            now + Duration::from_secs(15),
+            &[directed_reply_decode(
+                "ALPHA",
+                "B1",
+                ft8_decoder::ReplyWord::Rr73,
+            )],
+        );
+        tracker.ingest_frame(now + Duration::from_secs(30), std::slice::from_ref(&alpha));
+        maybe_auto_add_decoded_calls(
+            &mut queue,
+            &tracker,
+            &controller,
+            &[alpha],
+            now + Duration::from_secs(30),
+        );
+
+        let calls = queue
+            .entries
+            .iter()
+            .map(|entry| entry.callsign.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec!["ALPHA".to_string()]);
     }
 
     #[test]
