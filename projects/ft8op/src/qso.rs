@@ -583,15 +583,19 @@ impl QsoController {
                     event: ToUsEvent::Other,
                     ..
                 } => {
-                    session.no_fwd_count += 1;
-                    if session.no_fwd_count >= self.config.fsm.send_grid.no_fwd {
-                        exit_reason = Some("send_grid_no_fwd_limit");
+                    if session.last_tx_slot.is_some() {
+                        session.no_fwd_count += 1;
+                        if session.no_fwd_count >= self.config.fsm.send_grid.no_fwd {
+                            exit_reason = Some("send_grid_no_fwd_limit");
+                        }
                     }
                 }
                 _ => {
-                    session.no_msg_count += 1;
-                    if session.no_msg_count >= self.config.fsm.send_grid.no_msg {
-                        exit_reason = Some("send_grid_no_msg_limit");
+                    if session.last_tx_slot.is_some() {
+                        session.no_msg_count += 1;
+                        if session.no_msg_count >= self.config.fsm.send_grid.no_msg {
+                            exit_reason = Some("send_grid_no_msg_limit");
+                        }
                     }
                 }
             },
@@ -2531,15 +2535,19 @@ impl QsoController {
                     event: ToUsEvent::Other,
                     ..
                 } => {
-                    session.no_fwd_count += 1;
-                    if session.no_fwd_count >= config.fsm.send_grid.no_fwd {
-                        exit_reason = Some("send_grid_no_fwd_limit".to_string());
+                    if session.last_tx_slot.is_some() {
+                        session.no_fwd_count += 1;
+                        if session.no_fwd_count >= config.fsm.send_grid.no_fwd {
+                            exit_reason = Some("send_grid_no_fwd_limit".to_string());
+                        }
                     }
                 }
                 _ => {
-                    session.no_msg_count += 1;
-                    if session.no_msg_count >= config.fsm.send_grid.no_msg {
-                        exit_reason = Some("send_grid_no_msg_limit".to_string());
+                    if session.last_tx_slot.is_some() {
+                        session.no_msg_count += 1;
+                        if session.no_msg_count >= config.fsm.send_grid.no_msg {
+                            exit_reason = Some("send_grid_no_msg_limit".to_string());
+                        }
                     }
                 }
             },
@@ -5074,6 +5082,59 @@ mod tests {
     }
 
     #[test]
+    fn send_grid_no_msg_attempts_start_after_first_tx() {
+        let mut config = sample_config();
+        config.fsm.send_grid.no_msg = 2;
+        let mut controller = QsoController::new(config, Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("K1ABC", 1000.0),
+            Some(station_start_info("K1ABC", now, SlotFamily::Even)),
+            now,
+        );
+
+        controller.on_full_decode(now, &[cq_decode("K1ABC")], now + Duration::from_secs(14));
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_grid");
+        assert_eq!(snapshot.no_msg_count, 0);
+
+        let first_tx_slot = first_matching_slot_after(now, SlotFamily::Odd, Mode::Ft8);
+        controller.tick(tx_key_time_for_slot(first_tx_slot, Mode::Ft8));
+
+        let first_reply_slot =
+            first_matching_slot_after(first_tx_slot, SlotFamily::Even, Mode::Ft8);
+        controller.tick(first_reply_slot);
+        controller.on_full_decode(
+            first_reply_slot,
+            &[cq_decode("K1ABC")],
+            first_reply_slot + Duration::from_secs(14),
+        );
+        let snapshot = controller.snapshot(now);
+        assert_eq!(snapshot.state, "send_grid");
+        assert_eq!(snapshot.no_msg_count, 1);
+
+        let second_tx_slot =
+            first_matching_slot_after(first_reply_slot, SlotFamily::Odd, Mode::Ft8);
+        controller.tick(tx_key_time_for_slot(second_tx_slot, Mode::Ft8));
+        assert_eq!(
+            controller.session.as_ref().and_then(|s| s.last_tx_slot),
+            Some(second_tx_slot)
+        );
+
+        let second_reply_slot =
+            first_matching_slot_after(second_tx_slot, SlotFamily::Even, Mode::Ft8);
+        controller.tick(second_reply_slot);
+        controller.on_full_decode(
+            second_reply_slot,
+            &[cq_decode("K1ABC")],
+            second_reply_slot + Duration::from_secs(14),
+        );
+        let outcomes = controller.drain_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].exit_reason, "send_grid_no_msg_limit");
+    }
+
+    #[test]
     fn send_grid_plain_signal_report_transitions_to_sig_ack() {
         let mut controller =
             QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
@@ -6263,6 +6324,7 @@ mod tests {
             }),
             now,
         );
+        controller.session.as_mut().expect("session").last_tx_slot = Some(now);
         controller.on_decode_stage(
             rx_slot_start,
             DecodeStage::Early41,
