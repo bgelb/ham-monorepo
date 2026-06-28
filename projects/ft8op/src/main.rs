@@ -28,6 +28,7 @@ use rigctl::{
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
@@ -58,6 +59,7 @@ const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
 const CQ_ACTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const STATION_FINISH_COUNT_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DIRECT_CALL_PANE_RETENTION: Duration = Duration::from_secs(60 * 60);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const QSO_JSONL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -425,6 +427,7 @@ struct WebStationSummary {
     last_heard_freq_hz: f32,
     last_heard_snr_db: i32,
     last_heard_slot_family: String,
+    finish_count_10m: u32,
     is_in_qso: bool,
     in_qso_since: Option<String>,
     qso_with: Option<String>,
@@ -591,6 +594,7 @@ struct WebQueueEntry {
     callsign: String,
     queued_at: String,
     ok_to_schedule_after: String,
+    finish_count_10m: u32,
     direct_pending: bool,
     priority_direct: bool,
     direct_count: u32,
@@ -707,6 +711,7 @@ struct LoggedDecode {
     field2: String,
     info: String,
     text: String,
+    finish_reply: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1591,6 +1596,10 @@ impl WorkQueueState {
                     callsign: entry.callsign.clone(),
                     queued_at: format_time(entry.queued_at),
                     ok_to_schedule_after: format_time(entry.ok_to_schedule_after),
+                    finish_count_10m: tracker.finish_reply_unique_peer_count_since(
+                        &entry.callsign,
+                        now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now),
+                    ) as u32,
                     direct_pending: entry.direct_pending,
                     priority_direct,
                     direct_count: entry.direct_count,
@@ -1842,10 +1851,34 @@ impl WorkQueueState {
         now: SystemTime,
         tracker: &StationTracker,
     ) -> Option<QueueDispatch> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| self.entry_status(entry, tracker, now).ready)?;
+        let index =
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| self.entry_status(entry, tracker, now).ready)
+                .max_by(|(left_index, left), (right_index, right)| {
+                    let since = now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now);
+                    let left_fresh = !entry_has_been_retried(left);
+                    let right_fresh = !entry_has_been_retried(right);
+                    left_fresh
+                        .cmp(&right_fresh)
+                        .then_with(|| {
+                            if left_fresh && right_fresh {
+                                tracker
+                                    .finish_reply_unique_peer_count_since(&left.callsign, since)
+                                    .cmp(&tracker.finish_reply_unique_peer_count_since(
+                                        &right.callsign,
+                                        since,
+                                    ))
+                            } else {
+                                CmpOrdering::Equal
+                            }
+                        })
+                        .then_with(|| right.queued_at.cmp(&left.queued_at))
+                        .then_with(|| right.callsign.cmp(&left.callsign))
+                        .then_with(|| right_index.cmp(left_index))
+                })
+                .map(|(index, _)| index)?;
         let entry = self.entries.remove(index).expect("queue index valid");
         let tx_slot_family = tracker
             .start_info(&entry.callsign)
@@ -1923,6 +1956,10 @@ fn direct_observation_breaks_retry_backoff(observation: &DirectCallObservation) 
         observation.start_state,
         QsoState::SendRR73 | QsoState::Send73 | QsoState::Send73Once
     )
+}
+
+fn entry_has_been_retried(entry: &WorkQueueEntry) -> bool {
+    entry.ok_to_schedule_after > entry.queued_at
 }
 
 #[derive(Debug, Clone)]
@@ -2837,14 +2874,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-item {
       display: grid;
-      grid-template-columns: 78px 30px 36px 88px 88px 88px 58px 44px minmax(0, 1fr) 56px;
+      grid-template-columns: 78px 30px 36px 34px 88px 88px 88px 58px 44px minmax(0, 1fr) 56px;
       gap: 6px;
       align-items: baseline;
       padding: 3px 6px;
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
-      min-width: 760px;
+      min-width: 800px;
     }
     .queue-head {
       position: sticky;
@@ -3154,7 +3191,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <label class="toggle-row"><input id="qso-auto" type="checkbox"> Auto QSO From Queue</label>
             <button id="qso-stop" class="button warn" type="button">Stop</button>
           </div>
-          <div class="hint" id="qso-hint">Auto QSO starts the oldest ready station from the work queue.</div>
+          <div class="hint" id="qso-hint">Auto QSO starts the best ready station from the work queue.</div>
         </div>
         <div class="qso-summary">
           <div class="qso-kv"><div class="label">State</div><div class="qso-status-line" id="qso-state">idle</div></div>
@@ -3975,6 +4012,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div>Call</div>
           <div>Dir</div>
           <div>Cnt</div>
+          <div>F10</div>
           <div>Queued</div>
           <div>Ready</div>
           <div>Heard</div>
@@ -3994,6 +4032,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="queue-call">${renderCallValue(entry.callsign, entry.callsign)}</div>
           <div class="queue-meta">${entry.direct_pending ? 'Y' : '-'}</div>
           <div class="queue-meta">${escapeHtml(entry.direct_count ?? 0)}</div>
+          <div class="queue-meta">${escapeHtml(entry.finish_count_10m ?? 0)}</div>
           <div class="queue-meta">${escapeHtml(entry.queued_at)}</div>
           <div class="queue-meta">${escapeHtml(entry.ok_to_schedule_after)}</div>
           <div class="queue-meta">${escapeHtml(entry.direct_last_heard_at ?? entry.last_heard_at ?? '-')}</div>
@@ -6787,7 +6826,7 @@ fn refresh_web_snapshot(
         even_age_seconds: bandmap_age_seconds(bandmaps.even_last_updated_at, now),
         odd_age_seconds: bandmap_age_seconds(bandmaps.odd_last_updated_at, now),
     };
-    guard.stations = station_tracker.web_station_summaries();
+    guard.stations = station_tracker.web_station_summaries(now);
     guard.station_logs = station_tracker.web_logs();
     let direct_calls_since = now
         .checked_sub(DIRECT_CALL_PANE_RETENTION)
@@ -8588,6 +8627,7 @@ impl StationTracker {
             field2,
             info,
             text: decode.text.clone(),
+            finish_reply: message_is_finish_reply(&decode.message),
         };
         if let Some(existing) = self.logs.iter_mut().find(|entry| {
             entry.sender_call == sender_call && entry.slot_index == current_slot_index
@@ -8712,7 +8752,7 @@ impl StationTracker {
         });
     }
 
-    fn web_station_summaries(&self) -> Vec<WebStationSummary> {
+    fn web_station_summaries(&self, now: SystemTime) -> Vec<WebStationSummary> {
         self.stations
             .iter()
             .map(|(callsign, state)| WebStationSummary {
@@ -8721,6 +8761,10 @@ impl StationTracker {
                 last_heard_freq_hz: state.last_heard_freq_hz,
                 last_heard_snr_db: state.last_heard_snr_db,
                 last_heard_slot_family: state.last_heard_slot_family.as_str().to_string(),
+                finish_count_10m: self.finish_reply_unique_peer_count_since(
+                    callsign,
+                    now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now),
+                ) as u32,
                 is_in_qso: state.active_qso.is_some(),
                 in_qso_since: state.active_qso.as_ref().map(|qso| format_time(qso.since)),
                 qso_with: state
@@ -8823,6 +8867,20 @@ impl StationTracker {
             })
             .count()
     }
+
+    fn finish_reply_unique_peer_count_since(&self, callsign: &str, since: SystemTime) -> usize {
+        let mut peers = BTreeSet::new();
+        for entry in &self.logs {
+            if entry.received_at >= since
+                && entry.finish_reply
+                && entry.sender_call.eq_ignore_ascii_case(callsign)
+                && let Some(peer) = &entry.peer
+            {
+                peers.insert(self.peer_display(peer));
+            }
+        }
+        peers.len()
+    }
 }
 
 fn qso_peer_from_first_field(
@@ -8894,6 +8952,32 @@ fn message_ends_qso(message: &StructuredMessage) -> bool {
         StructuredMessage::Nonstandard { reply, .. } => matches!(
             reply,
             ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree
+        ),
+        StructuredMessage::Dxpedition { .. } => true,
+        StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => false,
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => false,
+    }
+}
+
+fn message_is_finish_reply(message: &StructuredMessage) -> bool {
+    match message {
+        StructuredMessage::Standard { info, .. } => match &info.value {
+            StructuredInfoValue::Grid { locator } if locator.eq_ignore_ascii_case("RR73") => true,
+            StructuredInfoValue::Reply {
+                word:
+                    ft8_decoder::ReplyWord::Rrr
+                    | ft8_decoder::ReplyWord::Rr73
+                    | ft8_decoder::ReplyWord::SeventyThree,
+            } => true,
+            _ => false,
+        },
+        StructuredMessage::Nonstandard { reply, .. } => matches!(
+            reply,
+            ft8_decoder::ReplyWord::Rrr
+                | ft8_decoder::ReplyWord::Rr73
+                | ft8_decoder::ReplyWord::SeventyThree
         ),
         StructuredMessage::Dxpedition { .. } => true,
         StructuredMessage::FieldDay { .. }
@@ -9805,6 +9889,29 @@ mod tests {
         }
     }
 
+    fn directed_reply_decode(from: &str, to: &str, word: ft8_decoder::ReplyWord) -> DecodedMessage {
+        let message = StructuredMessage::Standard {
+            i3: 0,
+            first: standard_call(to),
+            second: standard_call(from),
+            acknowledge: false,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::Reply { word },
+            },
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
     fn cq_decode(from: &str) -> DecodedMessage {
         let message = StructuredMessage::Standard {
             i3: 0,
@@ -10355,6 +10462,117 @@ mod tests {
 
         let dispatch = queue
             .scheduler_pick(now + Duration::from_secs(1), &tracker, false, false)
+            .expect("dispatch");
+        assert_eq!(dispatch.callsign, "OLDER");
+    }
+
+    #[test]
+    fn station_finish_count_tracks_unique_peers_in_last_10m() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut tracker = StationTracker::default();
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(590),
+            &directed_reply_decode("RUNNER", "A1", ft8_decoder::ReplyWord::Rr73),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(300),
+            &directed_reply_decode("RUNNER", "B2", ft8_decoder::ReplyWord::Rrr),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(120),
+            &directed_reply_decode("RUNNER", "B2", ft8_decoder::ReplyWord::SeventyThree),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(601),
+            &directed_reply_decode("RUNNER", "C3", ft8_decoder::ReplyWord::Rr73),
+        );
+
+        assert_eq!(
+            tracker
+                .finish_reply_unique_peer_count_since("RUNNER", now - STATION_FINISH_COUNT_WINDOW),
+            2
+        );
+    }
+
+    #[test]
+    fn queue_pick_prefers_fresh_ready_station_with_higher_finish_count() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut tracker = StationTracker::default();
+        ingest_decode(&mut tracker, now, &cq_decode("OLDER"));
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(120),
+            &directed_reply_decode("NEWER", "A1", ft8_decoder::ReplyWord::Rr73),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(90),
+            &directed_reply_decode("NEWER", "B2", ft8_decoder::ReplyWord::Rrr),
+        );
+        ingest_decode(&mut tracker, now, &cq_decode("NEWER"));
+
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.auto_enabled = true;
+        queue.add_station("OLDER", now, now).expect("older queued");
+        queue
+            .add_station(
+                "NEWER",
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(1),
+            )
+            .expect("newer queued");
+
+        let dispatch = queue
+            .scheduler_pick(now + Duration::from_secs(2), &tracker, false, false)
+            .expect("dispatch");
+        assert_eq!(dispatch.callsign, "NEWER");
+    }
+
+    #[test]
+    fn queue_pick_requeued_entries_fall_back_to_oldest_ready() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut tracker = StationTracker::default();
+        ingest_decode(&mut tracker, now, &cq_decode("OLDER"));
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(120),
+            &directed_reply_decode("NEWER", "A1", ft8_decoder::ReplyWord::Rr73),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(90),
+            &directed_reply_decode("NEWER", "B2", ft8_decoder::ReplyWord::Rrr),
+        );
+        ingest_decode(&mut tracker, now, &cq_decode("NEWER"));
+
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.auto_enabled = true;
+        queue
+            .add_station(
+                "OLDER",
+                now - Duration::from_secs(300),
+                now - Duration::from_secs(300),
+            )
+            .expect("older queued");
+        queue
+            .add_station(
+                "NEWER",
+                now - Duration::from_secs(200),
+                now - Duration::from_secs(200),
+            )
+            .expect("newer queued");
+        for entry in &mut queue.entries {
+            entry.ok_to_schedule_after = now - Duration::from_secs(1);
+        }
+
+        let dispatch = queue
+            .scheduler_pick(now, &tracker, false, false)
             .expect("dispatch");
         assert_eq!(dispatch.callsign, "OLDER");
     }
