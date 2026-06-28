@@ -1044,7 +1044,9 @@ impl WorkQueueState {
             entry.last_direct_text = Some(observation.text.clone());
             entry.last_direct_structured_json = Some(observation.structured_json.clone());
             entry.last_direct_fd_exchange = observation.received_fd_exchange.clone();
-            if entry.ok_to_schedule_after < now {
+            let retry_override = now >= entry.ok_to_schedule_after
+                || direct_observation_breaks_retry_backoff(&observation);
+            if retry_override {
                 entry.ok_to_schedule_after = now;
             }
             if !duplicate_slot {
@@ -1055,6 +1057,7 @@ impl WorkQueueState {
                 direct_count = entry.direct_count,
                 start_state = entry.direct_start_state.map(QsoState::as_str).unwrap_or(""),
                 duplicate_slot,
+                retry_override,
                 "queue_direct_updated"
             );
             return Ok(());
@@ -1913,6 +1916,13 @@ impl WorkQueueState {
         self.pause_cq_when_few_unique_calls
             && unique_calls_last_5m < self.cq_pause_min_unique_calls_5m as usize
     }
+}
+
+fn direct_observation_breaks_retry_backoff(observation: &DirectCallObservation) -> bool {
+    matches!(
+        observation.start_state,
+        QsoState::SendRR73 | QsoState::Send73 | QsoState::Send73Once
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -10377,7 +10387,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_observation_preserves_retry_backoff() {
+    fn direct_observation_with_forward_progress_overrides_retry_backoff() {
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         let now = UNIX_EPOCH + Duration::from_secs(30);
@@ -10397,11 +10407,49 @@ mod tests {
             slot_index: ft8_slot_index(direct_at),
             slot_family: ft8_slot_family(direct_at),
             snr_db: -5,
-            start_state: QsoState::SendSig,
+            start_state: QsoState::SendRR73,
             compound_eligible: true,
-            text: "N1VF K1ABC FN20".to_string(),
+            text: "N1VF K1ABC R 2A WWA".to_string(),
             structured_json: "{}".to_string(),
-            received_fd_exchange: None,
+            received_fd_exchange: Some(qso::FieldDayExchange::new(2, 'A', "WWA".to_string())),
+        };
+
+        queue
+            .add_direct_observation(observation, direct_at)
+            .expect("direct update");
+
+        let entry = queue.entries.front().expect("queued entry");
+        assert!(entry.direct_pending);
+        assert_eq!(entry.ok_to_schedule_after, direct_at);
+        assert!(queue.has_recent_priority_direct_for_slot(direct_at, direct_at));
+    }
+
+    #[test]
+    fn repeated_low_progress_direct_observation_preserves_retry_backoff() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let direct_at = now + Duration::from_secs(15);
+        let retry_until = now + Duration::from_secs(300);
+        queue
+            .add_station("K1ABC", now, now)
+            .expect("station queued");
+        queue
+            .entries
+            .front_mut()
+            .expect("queued entry")
+            .ok_to_schedule_after = retry_until;
+        let observation = DirectCallObservation {
+            callsign: "K1ABC".to_string(),
+            observed_at: direct_at,
+            slot_index: ft8_slot_index(direct_at),
+            slot_family: ft8_slot_family(direct_at),
+            snr_db: -5,
+            start_state: QsoState::SendSigAck,
+            compound_eligible: false,
+            text: "N1VF K1ABC 2A WWA".to_string(),
+            structured_json: "{}".to_string(),
+            received_fd_exchange: Some(qso::FieldDayExchange::new(2, 'A', "WWA".to_string())),
         };
 
         queue
