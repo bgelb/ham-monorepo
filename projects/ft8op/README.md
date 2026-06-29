@@ -120,6 +120,27 @@ Current defaults:
 - exchange = `1E SCV`
 - `completed_qso_log_path = logs/ft8op-field-day-completed.jsonl`
 
+### Field Day export
+
+Completed Field Day QSOs can be exported from the JSONL log to ADIF or Cabrillo:
+
+```sh
+cargo run -p ft8op --bin ft8op-fd-export -- \
+  --format adif \
+  --station-call AA6FD \
+  --output field-day.adi
+
+cargo run -p ft8op --bin ft8op-fd-export -- \
+  --format cabrillo \
+  --station-call AA6FD \
+  --operators AA6FD \
+  --output field-day.log
+```
+
+The exporter reads `logs/ft8op-field-day-completed.jsonl` by default. Use `--input`
+for a different completed-QSO log and `--dedupe` to keep only the first completed
+QSO for each call/band/mode tuple.
+
 ## Web UI
 
 The current UI layout is:
