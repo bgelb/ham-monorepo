@@ -65,5 +65,14 @@
   "logging": {
     "fsm_log_path": "logs/ft8op-qso.jsonl",
     "app_log_path": "logs/ft8op.log"
+  },
+  "field_day": {
+    "enabled_default": false,
+    "fd_only_default": true,
+    "preempt_73_after_rr73_default": true,
+    "transmitter_count": 1,
+    "class": "E",
+    "section": "SCV",
+    "completed_qso_log_path": "logs/ft8op-field-day-completed.jsonl"
   }
 }

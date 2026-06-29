@@ -21,6 +21,7 @@ Current top-level sections:
 - `queue`
 - `fsm`
 - `logging`
+- `field_day`
 
 ### `station`
 
@@ -103,6 +104,43 @@ Defaults:
 - `logs/ft8op-qso.jsonl`
 - `logs/ft8op.log`
 
+### `field_day`
+
+- `enabled_default`
+- `fd_only_default`
+- `transmitter_count`
+- `class`
+- `section`
+- `completed_qso_log_path`
+
+Current defaults:
+
+- `enabled_default = false`
+- `fd_only_default = true`
+- exchange = `1E SCV`
+- `completed_qso_log_path = logs/ft8op-field-day-completed.jsonl`
+
+### Field Day export
+
+Completed Field Day QSOs can be exported from the JSONL log to ADIF or Cabrillo:
+
+```sh
+cargo run -p ft8op --bin ft8op-fd-export -- \
+  --format adif \
+  --station-call AA6FD \
+  --output field-day.adi
+
+cargo run -p ft8op --bin ft8op-fd-export -- \
+  --format cabrillo \
+  --station-call AA6FD \
+  --operators AA6FD \
+  --output field-day.log
+```
+
+The exporter reads `logs/ft8op-field-day-completed.jsonl` by default. Use `--input`
+for a different completed-QSO log and `--dedupe` to keep only the first completed
+QSO for each call/band/mode tuple.
+
 ## Web UI
 
 The current UI layout is:
@@ -165,6 +203,9 @@ Queue controls currently include:
 - `No Message Retry Delay`
 - `No Fwd Retry Delay`
 - `CQ %`
+- `Field Day mode`
+- `FD-only automation`
+- `FD Tx` / `FD Class` / `FD Section`
 - `Flip Next CQ Parity`
 - `Clear Queue`
 - `Auto add direct calls`

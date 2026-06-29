@@ -28,6 +28,7 @@ use rigctl::{
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs::OpenOptions;
@@ -58,6 +59,7 @@ const DT_HISTORY_FRAMES: usize = 40;
 const STATION_RETENTION: Duration = Duration::from_secs(60 * 60);
 const QUEUE_HEARD_RETENTION: Duration = Duration::from_secs(10 * 60);
 const CQ_ACTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+const STATION_FINISH_COUNT_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DIRECT_CALL_PANE_RETENTION: Duration = Duration::from_secs(60 * 60);
 const RECENT_WORKED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const QSO_JSONL_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -252,6 +254,9 @@ enum QueueCommand {
     SetAutoAddAllDecodedCalls {
         enabled: bool,
     },
+    SetAutoAddDecodedRequireFinishCount {
+        enabled: bool,
+    },
     SetAutoAddDecodedMinCount5m {
         count: u32,
     },
@@ -272,6 +277,23 @@ enum QueueCommand {
     },
     SetCqPauseMinUniqueCalls5m {
         count: u32,
+    },
+    SetAnswerAttempts {
+        attempts: u32,
+    },
+    SetFieldDayEnabled {
+        enabled: bool,
+    },
+    SetFieldDayOnly {
+        enabled: bool,
+    },
+    SetFieldDayPreempt73AfterRr73 {
+        enabled: bool,
+    },
+    SetFieldDayExchange {
+        transmitter_count: u8,
+        class: char,
+        section: String,
     },
     SetCompoundRr73Handoff {
         enabled: bool,
@@ -408,6 +430,7 @@ struct WebStationSummary {
     last_heard_freq_hz: f32,
     last_heard_snr_db: i32,
     last_heard_slot_family: String,
+    finish_count_10m: u32,
     is_in_qso: bool,
     in_qso_since: Option<String>,
     qso_with: Option<String>,
@@ -489,6 +512,18 @@ struct QueueCountRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct QueueAttemptsRequest {
+    attempts: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueFieldDayExchangeRequest {
+    transmitter_count: u8,
+    class: String,
+    section: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct QueueTxFreqRequest {
     slot_family: String,
     tx_freq_hz: f32,
@@ -530,6 +565,7 @@ struct ApiStatus {
 struct WebQueueSnapshot {
     auto_enabled: bool,
     auto_add_all_decoded_calls: bool,
+    auto_add_decoded_require_finish_count: bool,
     auto_add_decoded_min_count_5m: u32,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
@@ -538,6 +574,13 @@ struct WebQueueSnapshot {
     pause_cq_when_few_unique_calls: bool,
     cq_pause_min_unique_calls_5m: u32,
     unique_calls_last_5m: u32,
+    answer_attempts: u32,
+    field_day_enabled: bool,
+    field_day_only: bool,
+    field_day_preempt_73_after_rr73: bool,
+    field_day_transmitter_count: u8,
+    field_day_class: String,
+    field_day_section: String,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
     use_compound_for_direct_signal_callers: bool,
@@ -555,6 +598,7 @@ struct WebQueueEntry {
     callsign: String,
     queued_at: String,
     ok_to_schedule_after: String,
+    finish_count_10m: u32,
     direct_pending: bool,
     priority_direct: bool,
     direct_count: u32,
@@ -582,6 +626,31 @@ struct WebQsoHistoryEntry {
     exit_reason: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CompletedQsoRecord {
+    schema_version: u8,
+    session_id: u64,
+    started_at: String,
+    completed_at: String,
+    call: String,
+    band: String,
+    frequency_hz: Option<u64>,
+    mode: String,
+    exchange_mode: String,
+    field_day_mode_active: bool,
+    field_day_only: bool,
+    sent_exchange: String,
+    sent_transmitter_count: Option<u8>,
+    received_exchange: String,
+    received_transmitter_count: Option<u8>,
+    received_class: String,
+    received_section: String,
+    contest_exchange_received: bool,
+    completion_confidence: String,
+    exit_reason: String,
+    last_rx_event: String,
+}
+
 #[derive(Debug, Clone)]
 struct StationTracker {
     mode: DecoderMode,
@@ -602,6 +671,7 @@ struct StationState {
     last_message_kind: StationLastMessageKind,
     last_text: String,
     last_structured_json: String,
+    last_fd_exchange: Option<qso::FieldDayExchange>,
     active_qso: Option<ActiveQso>,
     last_qso_ended_at: Option<SystemTime>,
     qso_history: Vec<CompletedQso>,
@@ -645,6 +715,7 @@ struct LoggedDecode {
     field2: String,
     info: String,
     text: String,
+    finish_reply: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -654,6 +725,7 @@ struct WorkQueueState {
     current_band: Option<String>,
     current_mode: DecoderMode,
     auto_add_all_decoded_calls: bool,
+    auto_add_decoded_require_finish_count: bool,
     auto_add_decoded_min_count_5m: u32,
     auto_add_direct_calls: bool,
     ignore_direct_calls_from_recently_worked: bool,
@@ -661,6 +733,11 @@ struct WorkQueueState {
     cq_percent: u8,
     pause_cq_when_few_unique_calls: bool,
     cq_pause_min_unique_calls_5m: u32,
+    answer_attempts: u32,
+    field_day_enabled: bool,
+    field_day_only: bool,
+    field_day_preempt_73_after_rr73: bool,
+    field_day_exchange: qso::FieldDayExchange,
     use_compound_rr73_handoff: bool,
     use_compound_73_once_handoff: bool,
     use_compound_for_direct_signal_callers: bool,
@@ -678,6 +755,7 @@ struct WorkQueueState {
 struct WorkedBandKey {
     callsign: String,
     band: String,
+    exchange_mode: qso::ExchangeMode,
 }
 
 #[derive(Debug, Clone)]
@@ -696,6 +774,7 @@ struct WorkQueueEntry {
     direct_compound_eligible: bool,
     last_direct_text: Option<String>,
     last_direct_structured_json: Option<String>,
+    last_direct_fd_exchange: Option<qso::FieldDayExchange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -741,6 +820,7 @@ struct DirectCallObservation {
     compound_eligible: bool,
     text: String,
     structured_json: String,
+    received_fd_exchange: Option<qso::FieldDayExchange>,
 }
 
 #[derive(Debug, Clone)]
@@ -754,6 +834,7 @@ enum QueueDispatchKind {
         context_text: Option<String>,
         context_structured_json: Option<String>,
         context_snr_db: Option<i32>,
+        context_fd_exchange: Option<qso::FieldDayExchange>,
     },
     Cq {
         tx_slot_family_override: Option<qso::SlotFamily>,
@@ -785,6 +866,7 @@ struct QsoJsonlSessionSummary {
     partner_call: String,
     rig_band: Option<String>,
     app_mode: Option<String>,
+    exchange_mode: Option<qso::ExchangeMode>,
     started_at: Option<SystemTime>,
     ended_at: Option<SystemTime>,
     last_seen_at: Option<SystemTime>,
@@ -823,10 +905,15 @@ impl WorkQueueState {
         self.current_mode = mode;
     }
 
-    fn worked_band_key(callsign: &str, band: &str) -> WorkedBandKey {
+    fn worked_band_key(
+        callsign: &str,
+        band: &str,
+        exchange_mode: qso::ExchangeMode,
+    ) -> WorkedBandKey {
         WorkedBandKey {
             callsign: callsign.to_string(),
             band: band.to_string(),
+            exchange_mode,
         }
     }
 
@@ -841,6 +928,7 @@ impl WorkQueueState {
             current_band: None,
             current_mode: DecoderMode::Ft8,
             auto_add_all_decoded_calls: config.queue.auto_add_all_decoded_calls_default,
+            auto_add_decoded_require_finish_count: false,
             auto_add_decoded_min_count_5m: config
                 .queue
                 .auto_add_decoded_min_count_5m_default
@@ -853,6 +941,15 @@ impl WorkQueueState {
             cq_percent: config.queue.cq_percent_default.min(100),
             pause_cq_when_few_unique_calls: config.queue.pause_cq_when_few_unique_calls_default,
             cq_pause_min_unique_calls_5m: config.queue.cq_pause_min_unique_calls_5m_default,
+            answer_attempts: config.fsm.send_grid.no_msg.clamp(1, 3),
+            field_day_enabled: config.field_day.enabled_default,
+            field_day_only: config.field_day.fd_only_default,
+            field_day_preempt_73_after_rr73: config.field_day.preempt_73_after_rr73_default,
+            field_day_exchange: qso::FieldDayExchange::new(
+                config.field_day.transmitter_count,
+                config.field_day.class,
+                config.field_day.section.clone(),
+            ),
             use_compound_rr73_handoff: config.queue.use_compound_rr73_handoff_default,
             use_compound_73_once_handoff: config.queue.use_compound_73_once_handoff_default,
             use_compound_for_direct_signal_callers: config
@@ -907,6 +1004,7 @@ impl WorkQueueState {
             direct_compound_eligible: false,
             last_direct_text: None,
             last_direct_structured_json: None,
+            last_direct_fd_exchange: None,
         });
         info!(callsign, queued_at = %format_time(now), "queue_add_accepted");
         Ok(())
@@ -956,7 +1054,10 @@ impl WorkQueueState {
             entry.direct_compound_eligible = observation.compound_eligible;
             entry.last_direct_text = Some(observation.text.clone());
             entry.last_direct_structured_json = Some(observation.structured_json.clone());
-            if entry.ok_to_schedule_after < now {
+            entry.last_direct_fd_exchange = observation.received_fd_exchange.clone();
+            let retry_override = now >= entry.ok_to_schedule_after
+                || direct_observation_breaks_retry_backoff(&observation);
+            if retry_override {
                 entry.ok_to_schedule_after = now;
             }
             if !duplicate_slot {
@@ -967,6 +1068,7 @@ impl WorkQueueState {
                 direct_count = entry.direct_count,
                 start_state = entry.direct_start_state.map(QsoState::as_str).unwrap_or(""),
                 duplicate_slot,
+                retry_override,
                 "queue_direct_updated"
             );
             return Ok(());
@@ -986,6 +1088,7 @@ impl WorkQueueState {
             direct_compound_eligible: observation.compound_eligible,
             last_direct_text: Some(observation.text),
             last_direct_structured_json: Some(observation.structured_json),
+            last_direct_fd_exchange: observation.received_fd_exchange,
         });
         info!(
             callsign = observation.callsign,
@@ -1088,6 +1191,14 @@ impl WorkQueueState {
         info!(enabled, "queue_auto_add_all_decoded_changed");
     }
 
+    fn set_auto_add_decoded_require_finish_count(&mut self, enabled: bool) {
+        self.auto_add_decoded_require_finish_count = enabled;
+        info!(
+            enabled,
+            "queue_auto_add_decoded_require_finish_count_changed"
+        );
+    }
+
     fn set_auto_add_decoded_min_count_5m(&mut self, count: u32) {
         self.auto_add_decoded_min_count_5m = count.max(1);
         info!(
@@ -1127,6 +1238,47 @@ impl WorkQueueState {
             min_unique_calls_5m = self.cq_pause_min_unique_calls_5m,
             "queue_cq_low_activity_threshold_changed"
         );
+    }
+
+    fn set_answer_attempts(&mut self, attempts: u32) {
+        self.answer_attempts = attempts.clamp(1, 3);
+        info!(
+            answer_attempts = self.answer_attempts,
+            "queue_answer_attempts_changed"
+        );
+    }
+
+    fn set_field_day_enabled(&mut self, enabled: bool) {
+        self.field_day_enabled = enabled;
+        info!(enabled, "queue_field_day_enabled_changed");
+    }
+
+    fn set_field_day_only(&mut self, enabled: bool) {
+        self.field_day_only = enabled;
+        info!(enabled, "queue_field_day_only_changed");
+    }
+
+    fn set_field_day_preempt_73_after_rr73(&mut self, enabled: bool) {
+        self.field_day_preempt_73_after_rr73 = enabled;
+        info!(enabled, "queue_field_day_preempt_73_after_rr73_changed");
+    }
+
+    fn set_field_day_exchange(&mut self, transmitter_count: u8, class: char, section: String) {
+        self.field_day_exchange = qso::FieldDayExchange::new(transmitter_count, class, section);
+        info!(
+            exchange = %self.field_day_exchange.as_text(),
+            "queue_field_day_exchange_changed"
+        );
+    }
+
+    fn exchange_mode(&self) -> qso::ExchangeMode {
+        if self.field_day_enabled
+            && matches!(self.current_mode, DecoderMode::Ft8 | DecoderMode::Ft4)
+        {
+            qso::ExchangeMode::FieldDay
+        } else {
+            qso::ExchangeMode::Normal
+        }
     }
 
     fn set_use_compound_rr73_handoff(&mut self, enabled: bool) {
@@ -1213,12 +1365,21 @@ impl WorkQueueState {
         });
     }
 
-    fn mark_worked(&mut self, callsign: &str, band: &str, worked_at: SystemTime) {
-        self.recent_worked
-            .insert(Self::worked_band_key(callsign, band), worked_at);
+    fn mark_worked(
+        &mut self,
+        callsign: &str,
+        band: &str,
+        exchange_mode: qso::ExchangeMode,
+        worked_at: SystemTime,
+    ) {
+        self.recent_worked.insert(
+            Self::worked_band_key(callsign, band, exchange_mode),
+            worked_at,
+        );
         info!(
             callsign,
             band,
+            exchange_mode = %exchange_mode.as_str(),
             worked_at = %format_time(worked_at),
             "recent_worked_updated"
         );
@@ -1229,7 +1390,7 @@ impl WorkQueueState {
             return false;
         };
         self.recent_worked
-            .get(&Self::worked_band_key(callsign, band))
+            .get(&Self::worked_band_key(callsign, band, self.exchange_mode()))
             .is_some_and(|worked_at| {
                 now.duration_since(*worked_at).unwrap_or_default() <= RECENT_WORKED_RETENTION
             })
@@ -1240,9 +1401,17 @@ impl WorkQueueState {
     }
 
     fn handle_qso_outcome(&mut self, outcome: &QsoOutcome, tracker: &StationTracker) {
-        if outcome.sent_terminal_73 {
+        let loggable_field_day_completion = outcome.exchange_mode == qso::ExchangeMode::FieldDay
+            && outcome.field_day_mode_active
+            && outcome.completion_confidence != qso::CompletionConfidence::Insufficient;
+        if outcome.sent_terminal_73 || loggable_field_day_completion {
             if let Some(band) = outcome.rig_band.as_deref() {
-                self.mark_worked(&outcome.partner_call, band, outcome.finished_at);
+                self.mark_worked(
+                    &outcome.partner_call,
+                    band,
+                    outcome.exchange_mode,
+                    outcome.finished_at,
+                );
             }
             self.remove_station(&outcome.partner_call, "already_worked");
         }
@@ -1268,6 +1437,7 @@ impl WorkQueueState {
                     direct_compound_eligible: false,
                     last_direct_text: None,
                     last_direct_structured_json: None,
+                    last_direct_fd_exchange: None,
                 });
                 info!(
                     callsign = outcome.partner_call,
@@ -1297,6 +1467,7 @@ impl WorkQueueState {
                     direct_compound_eligible: false,
                     last_direct_text: None,
                     last_direct_structured_json: None,
+                    last_direct_fd_exchange: None,
                 });
                 info!(
                     callsign = outcome.partner_call,
@@ -1439,6 +1610,10 @@ impl WorkQueueState {
                     callsign: entry.callsign.clone(),
                     queued_at: format_time(entry.queued_at),
                     ok_to_schedule_after: format_time(entry.ok_to_schedule_after),
+                    finish_count_10m: tracker.finish_reply_unique_peer_count_since(
+                        &entry.callsign,
+                        now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now),
+                    ) as u32,
                     direct_pending: entry.direct_pending,
                     priority_direct,
                     direct_count: entry.direct_count,
@@ -1457,6 +1632,7 @@ impl WorkQueueState {
         WebQueueSnapshot {
             auto_enabled: self.auto_enabled,
             auto_add_all_decoded_calls: self.auto_add_all_decoded_calls,
+            auto_add_decoded_require_finish_count: self.auto_add_decoded_require_finish_count,
             auto_add_decoded_min_count_5m: self.auto_add_decoded_min_count_5m,
             auto_add_direct_calls: self.auto_add_direct_calls,
             ignore_direct_calls_from_recently_worked: self.ignore_direct_calls_from_recently_worked,
@@ -1465,6 +1641,13 @@ impl WorkQueueState {
             pause_cq_when_few_unique_calls: self.pause_cq_when_few_unique_calls,
             cq_pause_min_unique_calls_5m: self.cq_pause_min_unique_calls_5m,
             unique_calls_last_5m,
+            answer_attempts: self.answer_attempts,
+            field_day_enabled: self.field_day_enabled,
+            field_day_only: self.field_day_only,
+            field_day_preempt_73_after_rr73: self.field_day_preempt_73_after_rr73,
+            field_day_transmitter_count: self.field_day_exchange.transmitter_count,
+            field_day_class: self.field_day_exchange.class.to_string(),
+            field_day_section: self.field_day_exchange.section.clone(),
             use_compound_rr73_handoff: self.use_compound_rr73_handoff,
             use_compound_73_once_handoff: self.use_compound_73_once_handoff,
             use_compound_for_direct_signal_callers: self.use_compound_for_direct_signal_callers,
@@ -1492,10 +1675,15 @@ impl WorkQueueState {
         let recent_worked = self.recent_worked.clone();
         let current_band = self.current_band.clone();
         let ignore_direct = self.ignore_direct_calls_from_recently_worked;
+        let exchange_mode = self.exchange_mode();
         self.entries.retain(|entry| {
             let worked_recently = current_band.as_deref().is_some_and(|band| {
                 recent_worked
-                    .get(&WorkQueueState::worked_band_key(&entry.callsign, band))
+                    .get(&WorkQueueState::worked_band_key(
+                        &entry.callsign,
+                        band,
+                        exchange_mode,
+                    ))
                     .is_some_and(|worked_at| {
                         now.duration_since(*worked_at).unwrap_or_default()
                             <= RECENT_WORKED_RETENTION
@@ -1637,6 +1825,7 @@ impl WorkQueueState {
                 context_text: entry.last_direct_text.clone(),
                 context_structured_json: entry.last_direct_structured_json.clone(),
                 context_snr_db: entry.last_direct_snr_db,
+                context_fd_exchange: entry.last_direct_fd_exchange.clone(),
             },
             callsign: entry.callsign.clone(),
             tx_slot_family,
@@ -1649,6 +1838,9 @@ impl WorkQueueState {
         now: SystemTime,
         excluded_callsign: Option<&str>,
     ) -> Option<QueueDispatch> {
+        if self.exchange_mode() == qso::ExchangeMode::FieldDay {
+            return None;
+        }
         if !self.use_compound_rr73_handoff && !self.use_compound_73_once_handoff {
             return None;
         }
@@ -1674,10 +1866,34 @@ impl WorkQueueState {
         now: SystemTime,
         tracker: &StationTracker,
     ) -> Option<QueueDispatch> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| self.entry_status(entry, tracker, now).ready)?;
+        let index =
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| self.entry_status(entry, tracker, now).ready)
+                .max_by(|(left_index, left), (right_index, right)| {
+                    let since = now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now);
+                    let left_fresh = !entry_has_been_retried(left);
+                    let right_fresh = !entry_has_been_retried(right);
+                    left_fresh
+                        .cmp(&right_fresh)
+                        .then_with(|| {
+                            if left_fresh && right_fresh {
+                                tracker
+                                    .finish_reply_unique_peer_count_since(&left.callsign, since)
+                                    .cmp(&tracker.finish_reply_unique_peer_count_since(
+                                        &right.callsign,
+                                        since,
+                                    ))
+                            } else {
+                                CmpOrdering::Equal
+                            }
+                        })
+                        .then_with(|| right.queued_at.cmp(&left.queued_at))
+                        .then_with(|| right.callsign.cmp(&left.callsign))
+                        .then_with(|| right_index.cmp(left_index))
+                })
+                .map(|(index, _)| index)?;
         let entry = self.entries.remove(index).expect("queue index valid");
         let tx_slot_family = tracker
             .start_info(&entry.callsign)
@@ -1696,6 +1912,7 @@ impl WorkQueueState {
                 context_text: None,
                 context_structured_json: None,
                 context_snr_db: None,
+                context_fd_exchange: None,
             },
             callsign: entry.callsign,
             tx_slot_family,
@@ -1747,6 +1964,17 @@ impl WorkQueueState {
         self.pause_cq_when_few_unique_calls
             && unique_calls_last_5m < self.cq_pause_min_unique_calls_5m as usize
     }
+}
+
+fn direct_observation_breaks_retry_backoff(observation: &DirectCallObservation) -> bool {
+    matches!(
+        observation.start_state,
+        QsoState::SendRR73 | QsoState::Send73 | QsoState::Send73Once
+    )
+}
+
+fn entry_has_been_retried(entry: &WorkQueueEntry) -> bool {
+    entry.ok_to_schedule_after > entry.queued_at
 }
 
 #[derive(Debug, Clone)]
@@ -2136,7 +2364,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .second-row {
       display: grid;
-      grid-template-columns: repeat(2, minmax(320px, 1fr));
+      grid-template-columns: minmax(760px, 1.35fr) minmax(360px, 0.65fr);
       gap: 16px;
       align-items: start;
     }
@@ -2315,10 +2543,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .detail-panel {
       height: 740px;
     }
-    .queue-panel,
-    .qso-panel {
-      height: 760px;
-    }
+    .queue-panel { height: 860px; }
+    .qso-panel { height: 760px; }
     .queue-panel {
       display: grid;
       grid-template-rows: auto auto auto auto minmax(0, 1fr);
@@ -2486,6 +2712,26 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .control-inline.dual {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+    .queue-control-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+      gap: 8px;
+      align-items: end;
+    }
+    .queue-control-grid .input-wrap {
+      min-width: 0;
+    }
+    .queue-control-grid .button {
+      min-height: 40px;
+      white-space: normal;
+      line-height: 1.15;
+    }
+    .queue-toggle-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 8px 14px;
+      margin-top: 8px;
+    }
     .input-wrap {
       display: grid;
       gap: 4px;
@@ -2610,6 +2856,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
       gap: 8px;
       color: var(--ink);
       font-size: 13px;
+      line-height: 1.25;
+      min-width: 0;
+    }
+    .toggle-row input {
+      flex: 0 0 auto;
     }
     .queue-list {
       margin-top: 0;
@@ -2638,14 +2889,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     .queue-item {
       display: grid;
-      grid-template-columns: 78px 30px 36px 88px 88px 88px 58px 44px minmax(0, 1fr) 56px;
+      grid-template-columns: 78px 30px 36px 34px 88px 88px 88px 58px 44px minmax(0, 1fr) 56px;
       gap: 6px;
       align-items: baseline;
       padding: 3px 6px;
       border: 1px solid rgba(143, 176, 192, 0.08);
       border-radius: 6px;
       background: rgba(19, 40, 56, 0.45);
-      min-width: 760px;
+      min-width: 800px;
     }
     .queue-head {
       position: sticky;
@@ -2856,7 +3107,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         </div>
         <div class="detail-block">
           <div class="label">Queue Controls</div>
-          <div class="control-inline">
+          <div class="queue-control-grid">
             <div class="input-wrap">
               <div class="label">No Message Retry Delay</div>
               <input id="queue-no-message-retry-delay" class="control-input" type="number" min="1" max="3600" step="1">
@@ -2890,14 +3141,38 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <input id="queue-cq-min-unique-calls-5m" class="control-input" type="number" min="0" max="1000" step="1">
             </div>
             <div class="input-wrap">
+              <div class="label">Answer Attempts</div>
+              <select id="queue-answer-attempts" class="control-input">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+              </select>
+            </div>
+            <div class="input-wrap">
               <div class="label">5m Unique Now</div>
               <div class="value small" id="queue-unique-calls-last-5m">0</div>
+            </div>
+            <div class="input-wrap">
+              <div class="label">FD Tx</div>
+              <input id="queue-fd-tx-count" class="control-input" type="number" min="1" max="32" step="1">
+            </div>
+            <div class="input-wrap">
+              <div class="label">FD Class</div>
+              <input id="queue-fd-class" class="control-input" type="text" maxlength="1">
+            </div>
+            <div class="input-wrap">
+              <div class="label">FD Section</div>
+              <input id="queue-fd-section" class="control-input" type="text" maxlength="4">
             </div>
             <button id="queue-next-cq-parity" class="button secondary" type="button">Flip Next CQ Parity</button>
             <button id="queue-clear" class="button secondary" type="button">Clear Queue</button>
           </div>
-        <div class="control-row">
+        <div class="queue-toggle-grid">
+          <label class="toggle-row"><input id="queue-field-day-enabled" type="checkbox"> Field Day mode</label>
+          <label class="toggle-row"><input id="queue-field-day-only" type="checkbox"> FD-only automation</label>
+          <label class="toggle-row"><input id="queue-field-day-preempt-73-after-rr73" type="checkbox"> FD skip final 73 for active caller</label>
           <label class="toggle-row"><input id="queue-auto-add-decoded" type="checkbox"> Auto add eligible decodes</label>
+          <label class="toggle-row"><input id="queue-auto-add-f10" type="checkbox"> Auto add only F10&gt;0</label>
           <label class="toggle-row"><input id="queue-auto-add-direct" type="checkbox"> Auto add direct calls</label>
           <label class="toggle-row"><input id="queue-ignore-direct-worked" type="checkbox"> Ignore direct calls from already worked stations</label>
           <label class="toggle-row"><input id="queue-cq-enabled" type="checkbox"> Enable CQ</label>
@@ -2932,7 +3207,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <label class="toggle-row"><input id="qso-auto" type="checkbox"> Auto QSO From Queue</label>
             <button id="qso-stop" class="button warn" type="button">Stop</button>
           </div>
-          <div class="hint" id="qso-hint">Auto QSO starts the oldest ready station from the work queue.</div>
+          <div class="hint" id="qso-hint">Auto QSO starts the best ready station from the work queue.</div>
         </div>
         <div class="qso-summary">
           <div class="qso-kv"><div class="label">State</div><div class="qso-status-line" id="qso-state">idle</div></div>
@@ -3235,6 +3510,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       await postJson('/api/queue/auto-add-decoded', { enabled });
       scheduleRefresh(10);
     }
+    async function updateQueueAutoAddF10(enabled) {
+      await postJson('/api/queue/auto-add-f10', { enabled });
+      scheduleRefresh(10);
+    }
     async function updateQueueAutoAddDecodedMinCount5m(count) {
       await postJson('/api/queue/auto-add-decoded-min-count-5m', { count });
       scheduleRefresh(10);
@@ -3273,6 +3552,30 @@ const INDEX_HTML: &str = r#"<!doctype html>
     }
     async function updateQueueCqMinUniqueCalls5m(count) {
       await postJson('/api/queue/cq-min-unique-calls-5m', { count });
+      scheduleRefresh(10);
+    }
+    async function updateQueueAnswerAttempts(attempts) {
+      await postJson('/api/queue/answer-attempts', { attempts });
+      scheduleRefresh(10);
+    }
+    async function updateQueueFieldDayEnabled(enabled) {
+      await postJson('/api/queue/field-day-enabled', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueFieldDayOnly(enabled) {
+      await postJson('/api/queue/field-day-only', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueFieldDayPreempt73AfterRr73(enabled) {
+      await postJson('/api/queue/field-day-preempt-73-after-rr73', { enabled });
+      scheduleRefresh(10);
+    }
+    async function updateQueueFieldDayExchange(transmitterCount, fdClass, section) {
+      await postJson('/api/queue/field-day-exchange', {
+        transmitter_count: transmitterCount,
+        class: fdClass,
+        section,
+      });
       scheduleRefresh(10);
     }
     async function updateQueueTxFreq(txParity, txFreqHz) {
@@ -3648,12 +3951,20 @@ const INDEX_HTML: &str = r#"<!doctype html>
       const noMessageRetryDelay = document.getElementById('queue-no-message-retry-delay');
       const noForwardRetryDelay = document.getElementById('queue-no-forward-retry-delay');
       const autoAddDecoded = document.getElementById('queue-auto-add-decoded');
+      const autoAddF10 = document.getElementById('queue-auto-add-f10');
       const autoAddDecodedMinCount5m = document.getElementById('queue-auto-add-decoded-min-count-5m');
       const autoAddDirect = document.getElementById('queue-auto-add-direct');
       const ignoreDirectWorked = document.getElementById('queue-ignore-direct-worked');
+      const fieldDayEnabled = document.getElementById('queue-field-day-enabled');
+      const fieldDayOnly = document.getElementById('queue-field-day-only');
+      const fieldDayPreempt73AfterRr73 = document.getElementById('queue-field-day-preempt-73-after-rr73');
+      const fieldDayTxCount = document.getElementById('queue-fd-tx-count');
+      const fieldDayClass = document.getElementById('queue-fd-class');
+      const fieldDaySection = document.getElementById('queue-fd-section');
       const cqEnabled = document.getElementById('queue-cq-enabled');
       const pauseCqLowActivity = document.getElementById('queue-pause-cq-low-activity');
       const cqMinUniqueCalls5m = document.getElementById('queue-cq-min-unique-calls-5m');
+      const answerAttempts = document.getElementById('queue-answer-attempts');
       const uniqueCallsLast5m = document.getElementById('queue-unique-calls-last-5m');
       const compoundRr73 = document.getElementById('queue-compound-rr73');
       const compound73Once = document.getElementById('queue-compound-73-once');
@@ -3673,13 +3984,32 @@ const INDEX_HTML: &str = r#"<!doctype html>
         autoAddDecodedMinCount5m.value = String(queue.auto_add_decoded_min_count_5m ?? 2);
       }
       autoAddDirect.checked = !!queue.auto_add_direct_calls;
+      autoAddF10.checked = !!queue.auto_add_decoded_require_finish_count;
+      autoAddF10.disabled = !queue.auto_add_all_decoded_calls;
       ignoreDirectWorked.checked = !!queue.ignore_direct_calls_from_recently_worked;
+      fieldDayEnabled.checked = !!queue.field_day_enabled;
+      fieldDayOnly.checked = !!queue.field_day_only;
+      fieldDayPreempt73AfterRr73.checked = !!queue.field_day_preempt_73_after_rr73;
+      fieldDayPreempt73AfterRr73.disabled = !queue.field_day_enabled;
+      if (fieldDayTxCount.value === '' || Number(fieldDayTxCount.value) !== Number(queue.field_day_transmitter_count)) {
+        fieldDayTxCount.value = String(queue.field_day_transmitter_count ?? 1);
+      }
+      if (fieldDayClass.value.toUpperCase() !== String(queue.field_day_class ?? 'E')) {
+        fieldDayClass.value = String(queue.field_day_class ?? 'E');
+      }
+      if (fieldDaySection.value.toUpperCase() !== String(queue.field_day_section ?? 'SCV')) {
+        fieldDaySection.value = String(queue.field_day_section ?? 'SCV');
+      }
       cqEnabled.checked = !!queue.cq_enabled;
       pauseCqLowActivity.checked = !!queue.pause_cq_when_few_unique_calls;
       compoundRr73.checked = !!queue.use_compound_rr73_handoff;
       compound73Once.checked = !!queue.use_compound_73_once_handoff;
       compoundDirectSignal.checked = !!queue.use_compound_for_direct_signal_callers;
+      compoundRr73.disabled = !!queue.field_day_enabled;
+      compound73Once.disabled = !!queue.field_day_enabled;
+      compoundDirectSignal.disabled = !!queue.field_day_enabled;
       cqPercent.value = String(queue.cq_percent ?? 80);
+      answerAttempts.value = String(queue.answer_attempts ?? 3);
       uniqueCallsLast5m.textContent = String(queue.unique_calls_last_5m ?? 0);
       nextCqParity.textContent = queue.next_cq_parity_flipped ? 'Next CQ Parity Flipped' : 'Flip Next CQ Parity';
       if (
@@ -3705,6 +4035,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div>Call</div>
           <div>Dir</div>
           <div>Cnt</div>
+          <div>F10</div>
           <div>Queued</div>
           <div>Ready</div>
           <div>Heard</div>
@@ -3724,6 +4055,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <div class="queue-call">${renderCallValue(entry.callsign, entry.callsign)}</div>
           <div class="queue-meta">${entry.direct_pending ? 'Y' : '-'}</div>
           <div class="queue-meta">${escapeHtml(entry.direct_count ?? 0)}</div>
+          <div class="queue-meta">${escapeHtml(entry.finish_count_10m ?? 0)}</div>
           <div class="queue-meta">${escapeHtml(entry.queued_at)}</div>
           <div class="queue-meta">${escapeHtml(entry.ok_to_schedule_after)}</div>
           <div class="queue-meta">${escapeHtml(entry.direct_last_heard_at ?? entry.last_heard_at ?? '-')}</div>
@@ -3998,6 +4330,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
     document.getElementById('queue-auto-add-decoded').addEventListener('change', (event) => {
       updateQueueAutoAddDecoded(event.currentTarget.checked).catch((error) => console.error(error));
     });
+    document.getElementById('queue-auto-add-f10').addEventListener('change', (event) => {
+      updateQueueAutoAddF10(event.currentTarget.checked).catch((error) => console.error(error));
+    });
     document.getElementById('queue-auto-add-decoded-min-count-5m').addEventListener('change', (event) => {
       const value = Number(event.currentTarget.value);
       if (!Number.isFinite(value) || value < 1 || value > 1000) {
@@ -4006,12 +4341,42 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
       updateQueueAutoAddDecodedMinCount5m(Math.round(value)).catch((error) => console.error(error));
     });
+    document.getElementById('queue-answer-attempts').addEventListener('change', (event) => {
+      const value = Number(event.currentTarget.value);
+      if (![1, 2, 3].includes(value)) {
+        if (lastSnapshot) renderQueue(lastSnapshot);
+        return;
+      }
+      updateQueueAnswerAttempts(value).catch((error) => console.error(error));
+    });
     document.getElementById('queue-auto-add-direct').addEventListener('change', (event) => {
       updateQueueAutoAddDirect(event.currentTarget.checked).catch((error) => console.error(error));
     });
     document.getElementById('queue-ignore-direct-worked').addEventListener('change', (event) => {
       updateQueueIgnoreDirectWorked(event.currentTarget.checked).catch((error) => console.error(error));
     });
+    document.getElementById('queue-field-day-enabled').addEventListener('change', (event) => {
+      updateQueueFieldDayEnabled(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-field-day-only').addEventListener('change', (event) => {
+      updateQueueFieldDayOnly(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    document.getElementById('queue-field-day-preempt-73-after-rr73').addEventListener('change', (event) => {
+      updateQueueFieldDayPreempt73AfterRr73(event.currentTarget.checked).catch((error) => console.error(error));
+    });
+    function submitFieldDayExchange() {
+      const txCount = Number(document.getElementById('queue-fd-tx-count').value);
+      const fdClass = document.getElementById('queue-fd-class').value.trim().toUpperCase();
+      const section = document.getElementById('queue-fd-section').value.trim().toUpperCase();
+      if (!Number.isFinite(txCount) || txCount < 1 || txCount > 32 || !/^[A-H]$/.test(fdClass) || !section) {
+        if (lastSnapshot) renderQueue(lastSnapshot);
+        return;
+      }
+      updateQueueFieldDayExchange(Math.round(txCount), fdClass, section).catch((error) => console.error(error));
+    }
+    document.getElementById('queue-fd-tx-count').addEventListener('change', submitFieldDayExchange);
+    document.getElementById('queue-fd-class').addEventListener('change', submitFieldDayExchange);
+    document.getElementById('queue-fd-section').addEventListener('change', submitFieldDayExchange);
     document.getElementById('queue-cq-enabled').addEventListener('change', (event) => {
       updateQueueCqEnabled(event.currentTarget.checked).catch((error) => console.error(error));
     });
@@ -4095,6 +4460,10 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                     post(api_queue_auto_add_decoded_handler),
                 )
                 .route(
+                    "/api/queue/auto-add-f10",
+                    post(api_queue_auto_add_f10_handler),
+                )
+                .route(
                     "/api/queue/auto-add-decoded-min-count-5m",
                     post(api_queue_auto_add_decoded_min_count_5m_handler),
                 )
@@ -4115,6 +4484,26 @@ fn start_web_server(bind: &str, state: WebAppState) -> Result<(), AppError> {
                 .route(
                     "/api/queue/cq-min-unique-calls-5m",
                     post(api_queue_cq_min_unique_calls_5m_handler),
+                )
+                .route(
+                    "/api/queue/answer-attempts",
+                    post(api_queue_answer_attempts_handler),
+                )
+                .route(
+                    "/api/queue/field-day-enabled",
+                    post(api_queue_field_day_enabled_handler),
+                )
+                .route(
+                    "/api/queue/field-day-only",
+                    post(api_queue_field_day_only_handler),
+                )
+                .route(
+                    "/api/queue/field-day-preempt-73-after-rr73",
+                    post(api_queue_field_day_preempt_73_after_rr73_handler),
+                )
+                .route(
+                    "/api/queue/field-day-exchange",
+                    post(api_queue_field_day_exchange_handler),
                 )
                 .route(
                     "/api/queue/compound-rr73-handoff",
@@ -4275,6 +4664,24 @@ async fn api_queue_auto_add_decoded_handler(
     )
 }
 
+async fn api_queue_auto_add_f10_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetAutoAddDecodedRequireFinishCount {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue decoded F10 auto-add filter updated".to_string(),
+        }),
+    )
+}
+
 async fn api_queue_auto_add_decoded_min_count_5m_handler(
     State(state): State<WebAppState>,
     Json(request): Json<QueueCountRequest>,
@@ -4418,6 +4825,148 @@ async fn api_queue_cq_min_unique_calls_5m_handler(
         Json(ApiStatus {
             ok: true,
             message: "queue cq 5m unique threshold updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_answer_attempts_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueAttemptsRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    if !(1..=3).contains(&request.attempts) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "answer attempts must be 1, 2, or 3".to_string(),
+            }),
+        );
+    }
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetAnswerAttempts {
+            attempts: request.attempts,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "queue answer attempts updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_field_day_enabled_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetFieldDayEnabled {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "field day mode updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_field_day_only_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state.queue_control.enqueue(QueueCommand::SetFieldDayOnly {
+        enabled: request.enabled,
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "field day only updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_field_day_preempt_73_after_rr73_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFlagRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetFieldDayPreempt73AfterRr73 {
+            enabled: request.enabled,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "field day 73 preemption updated".to_string(),
+        }),
+    )
+}
+
+async fn api_queue_field_day_exchange_handler(
+    State(state): State<WebAppState>,
+    Json(request): Json<QueueFieldDayExchangeRequest>,
+) -> (StatusCode, Json<ApiStatus>) {
+    if !(1..=32).contains(&request.transmitter_count) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "transmitter count must be between 1 and 32".to_string(),
+            }),
+        );
+    }
+    let Some(class) = request
+        .class
+        .trim()
+        .chars()
+        .next()
+        .map(|ch| ch.to_ascii_uppercase())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "field day class required".to_string(),
+            }),
+        );
+    };
+    if !('A'..='H').contains(&class) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "field day class must be A-H".to_string(),
+            }),
+        );
+    }
+    let section = request.section.trim().to_uppercase();
+    if section.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiStatus {
+                ok: false,
+                message: "field day section required".to_string(),
+            }),
+        );
+    }
+    state
+        .queue_control
+        .enqueue(QueueCommand::SetFieldDayExchange {
+            transmitter_count: request.transmitter_count,
+            class,
+            section,
+        });
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiStatus {
+            ok: true,
+            message: "field day exchange updated".to_string(),
         }),
     )
 }
@@ -4847,6 +5396,94 @@ fn init_tracing(config: &AppConfig) -> Result<(), AppError> {
     Ok(())
 }
 
+fn maybe_append_completed_qso_jsonl(config: &AppConfig, outcome: &QsoOutcome) {
+    if outcome.exchange_mode != qso::ExchangeMode::FieldDay || !outcome.field_day_mode_active {
+        return;
+    }
+    if outcome.completion_confidence == qso::CompletionConfidence::Insufficient {
+        return;
+    }
+    if !outcome.sent_fd_exchange {
+        return;
+    }
+    let path = PathBuf::from(&config.field_day.completed_qso_log_path);
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        warn!(path = %path.display(), %error, "completed_qso_log_create_dir_failed");
+        return;
+    }
+    let record = CompletedQsoRecord {
+        schema_version: 1,
+        session_id: outcome.session_id,
+        started_at: format_datetime(outcome.started_at),
+        completed_at: format_datetime(outcome.finished_at),
+        call: outcome.partner_call.clone(),
+        band: outcome.rig_band.clone().unwrap_or_else(|| "-".to_string()),
+        frequency_hz: outcome.rig_frequency_hz,
+        mode: outcome.app_mode.as_str().to_uppercase(),
+        exchange_mode: outcome.exchange_mode.as_str().to_string(),
+        field_day_mode_active: outcome.field_day_mode_active,
+        field_day_only: outcome.field_day_only,
+        sent_exchange: outcome.sent_fd_exchange_text.clone(),
+        sent_transmitter_count: fd_exchange_transmitter_count(&outcome.sent_fd_exchange_text),
+        received_exchange: outcome
+            .received_fd_exchange
+            .as_ref()
+            .map(qso::FieldDayExchange::as_text)
+            .unwrap_or_default(),
+        received_transmitter_count: outcome
+            .received_fd_exchange
+            .as_ref()
+            .map(|exchange| exchange.transmitter_count),
+        received_class: outcome
+            .received_fd_exchange
+            .as_ref()
+            .map(|exchange| exchange.class.to_string())
+            .unwrap_or_default(),
+        received_section: outcome
+            .received_fd_exchange
+            .as_ref()
+            .map(|exchange| exchange.section.clone())
+            .unwrap_or_default(),
+        contest_exchange_received: outcome.contest_exchange_received,
+        completion_confidence: outcome.completion_confidence.as_str().to_string(),
+        exit_reason: outcome.exit_reason.clone(),
+        last_rx_event: outcome.last_rx_event.clone().unwrap_or_default(),
+    };
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(error) => {
+            warn!(%error, "completed_qso_log_serialize_failed");
+            return;
+        }
+    };
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "completed_qso_log_open_failed");
+            return;
+        }
+    };
+    use std::io::Write as _;
+    if let Err(error) = writeln!(file, "{line}") {
+        warn!(path = %path.display(), %error, "completed_qso_log_write_failed");
+    }
+}
+
+fn fd_exchange_transmitter_count(exchange: &str) -> Option<u8> {
+    let designator = exchange.split_whitespace().next()?.trim().to_uppercase();
+    let class = designator.chars().last()?;
+    if !matches!(class, 'A'..='F') {
+        return None;
+    }
+    let digits = &designator[..designator.len().saturating_sub(class.len_utf8())];
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u8>().ok()
+}
+
 fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTime) -> QsoJsonlScan {
     let mut sessions = BTreeMap::<QsoHistoryKey, QsoJsonlSessionSummary>::new();
     let mut active_keys = BTreeMap::<u64, QsoHistoryKey>::new();
@@ -4912,6 +5549,16 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             .get("app_mode")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let exchange_mode = fields
+            .get("exchange_mode")
+            .and_then(|value| value.as_str())
+            .map(parse_exchange_mode)
+            .unwrap_or(qso::ExchangeMode::Normal);
+        let received_fd_exchange = fields
+            .get("received_fd_exchange")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
         let key = if event == "start" {
             let key = QsoHistoryKey {
                 session_id,
@@ -4939,12 +5586,17 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
             });
         if session.partner_call.is_empty() {
             session.partner_call = partner_call.to_string();
+        } else if session.partner_call == "CQ" && partner_call != "CQ" {
+            session.partner_call = partner_call.to_string();
         }
         if !rig_band.is_empty() && session.rig_band.is_none() {
             session.rig_band = Some(rig_band.to_string());
         }
         if !app_mode.is_empty() && session.app_mode.is_none() {
             session.app_mode = Some(app_mode.to_uppercase());
+        }
+        if session.exchange_mode.is_none() {
+            session.exchange_mode = Some(exchange_mode);
         }
         session.last_seen_at = Some(timestamp);
         if event == "start" && session.started_at.is_none() {
@@ -4978,6 +5630,7 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                 let key = WorkedBandKey {
                     callsign: partner_call.to_string(),
                     band: rig_band.to_string(),
+                    exchange_mode,
                 };
                 match recent_worked.get(&key).copied() {
                     Some(existing) if existing >= timestamp => {}
@@ -5007,7 +5660,16 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
         {
             push_unique_info(&mut session.sent_infos, info);
         }
-        if let Some(info) = extract_exchange_info(rx_text) {
+        if !received_fd_exchange.is_empty() {
+            push_unique_info(
+                &mut session.received_infos,
+                received_fd_exchange.to_string(),
+            );
+        } else if exchange_mode == qso::ExchangeMode::FieldDay {
+            if let Some(info) = extract_field_day_exchange_info(rx_text) {
+                push_unique_info(&mut session.received_infos, info);
+            }
+        } else if let Some(info) = extract_exchange_info(rx_text) {
             push_unique_info(&mut session.received_infos, info);
         }
     }
@@ -5020,6 +5682,12 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
                 .or(session.last_seen_at)
                 .or(session.started_at)?;
             let age = now.duration_since(time).unwrap_or_default();
+            if session.exit_reason.as_deref() == Some("send_cq_direct_preempt") {
+                return None;
+            }
+            if session.partner_call == "CQ" {
+                return None;
+            }
             Some((
                 time,
                 WebQsoHistoryEntry {
@@ -5064,17 +5732,40 @@ fn scan_qso_jsonl(contents: &str, now: SystemTime, direct_calls_since: SystemTim
 }
 
 fn extract_exchange_info(text: &str) -> Option<String> {
-    let mut parts = text.split_whitespace();
-    let _first = parts.next()?;
-    let _second = parts.next()?;
-    let info = parts.next()?.trim().to_uppercase();
+    let parts = text
+        .split_whitespace()
+        .map(|part| part.trim().to_uppercase())
+        .collect::<Vec<_>>();
+    if let Some(exchange) = extract_field_day_exchange_info_from_parts(&parts) {
+        return Some(exchange);
+    }
+    let info = parts.get(2)?.as_str();
     if info.is_empty() {
         return None;
     }
-    if matches!(info.as_str(), "73" | "RR73" | "RRR") {
+    if matches!(info, "73" | "RR73" | "RRR") {
         return None;
     }
-    Some(info)
+    Some(info.to_string())
+}
+
+fn extract_field_day_exchange_info(text: &str) -> Option<String> {
+    let parts = text
+        .split_whitespace()
+        .map(|part| part.trim().to_uppercase())
+        .collect::<Vec<_>>();
+    extract_field_day_exchange_info_from_parts(&parts)
+}
+
+fn extract_field_day_exchange_info_from_parts(parts: &[String]) -> Option<String> {
+    let info = parts.get(2)?.as_str();
+    if parts.len() >= 5 && info == "R" && is_field_day_exchange_designator(&parts[3]) {
+        return Some(format!("{} {}", parts[3], parts[4]));
+    }
+    if parts.len() >= 4 && is_field_day_exchange_designator(info) {
+        return Some(format!("{} {}", info, parts[3]));
+    }
+    None
 }
 
 fn extract_tx_exchange_info(
@@ -5083,6 +5774,13 @@ fn extract_tx_exchange_info(
     partner_call: &str,
     compound_next_call: &str,
 ) -> Option<String> {
+    if text
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("CQ"))
+    {
+        return None;
+    }
     if text.contains(" RR73; ") {
         if event == "compound_start"
             || (!compound_next_call.is_empty()
@@ -5124,6 +5822,24 @@ fn parse_direct_message_calls(text: &str) -> Option<(String, String)> {
 fn push_unique_info(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
+    }
+}
+
+fn is_field_day_exchange_designator(value: &str) -> bool {
+    let Some(class) = value.chars().last() else {
+        return false;
+    };
+    if !matches!(class, 'A'..='F') {
+        return false;
+    }
+    let digits = &value[..value.len().saturating_sub(class.len_utf8())];
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn parse_exchange_mode(value: &str) -> qso::ExchangeMode {
+    match value {
+        "field_day" => qso::ExchangeMode::FieldDay,
+        _ => qso::ExchangeMode::Normal,
     }
 }
 
@@ -5236,6 +5952,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         qso_controller.defaults().tx_freq_default_hz,
         qso_jsonl_cache.recent_worked.clone(),
     );
+    qso_controller.set_field_day_runtime(
+        work_queue.field_day_enabled,
+        work_queue.field_day_only,
+        work_queue.field_day_preempt_73_after_rr73,
+        work_queue.field_day_exchange.clone(),
+    );
+    qso_controller.set_answer_attempts(work_queue.answer_attempts);
     let web_snapshot = Arc::new(Mutex::new(WebSnapshot {
         qso_defaults: qso_controller.defaults(),
         qso: qso_controller.snapshot(SystemTime::now()),
@@ -5380,6 +6103,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         let now = SystemTime::now();
         qso_controller.tick(now);
         for outcome in qso_controller.drain_outcomes() {
+            maybe_append_completed_qso_jsonl(&config, &outcome);
             work_queue.handle_qso_outcome(&outcome, &station_tracker);
         }
         while let Ok(refresh) = qso_jsonl_refresh_rx.try_recv() {
@@ -5433,6 +6157,9 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QueueCommand::SetAutoAddAllDecodedCalls { enabled } => {
                     work_queue.set_auto_add_all_decoded_calls(enabled)
                 }
+                QueueCommand::SetAutoAddDecodedRequireFinishCount { enabled } => {
+                    work_queue.set_auto_add_decoded_require_finish_count(enabled)
+                }
                 QueueCommand::SetAutoAddDecodedMinCount5m { count } => {
                     work_queue.set_auto_add_decoded_min_count_5m(count)
                 }
@@ -5450,6 +6177,21 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QueueCommand::SetCqPauseMinUniqueCalls5m { count } => {
                     work_queue.set_cq_pause_min_unique_calls_5m(count)
                 }
+                QueueCommand::SetAnswerAttempts { attempts } => {
+                    work_queue.set_answer_attempts(attempts)
+                }
+                QueueCommand::SetFieldDayEnabled { enabled } => {
+                    work_queue.set_field_day_enabled(enabled)
+                }
+                QueueCommand::SetFieldDayOnly { enabled } => work_queue.set_field_day_only(enabled),
+                QueueCommand::SetFieldDayPreempt73AfterRr73 { enabled } => {
+                    work_queue.set_field_day_preempt_73_after_rr73(enabled)
+                }
+                QueueCommand::SetFieldDayExchange {
+                    transmitter_count,
+                    class,
+                    section,
+                } => work_queue.set_field_day_exchange(transmitter_count, class, section),
                 QueueCommand::SetCompoundRr73Handoff { enabled } => {
                     work_queue.set_use_compound_rr73_handoff(enabled)
                 }
@@ -5462,6 +6204,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
                 QueueCommand::ToggleNextCqParity => work_queue.toggle_next_cq_parity(),
             }
         }
+        qso_controller.set_field_day_runtime(
+            work_queue.field_day_enabled,
+            work_queue.field_day_only,
+            work_queue.field_day_preempt_73_after_rr73,
+            work_queue.field_day_exchange.clone(),
+        );
+        qso_controller.set_answer_attempts(work_queue.answer_attempts);
         for command in rig_control.drain() {
             match command {
                 RigCommand::Configure {
@@ -5870,6 +6619,7 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
         }
         qso_controller.tick(SystemTime::now());
         for outcome in qso_controller.drain_outcomes() {
+            maybe_append_completed_qso_jsonl(&config, &outcome);
             work_queue.handle_qso_outcome(&outcome, &station_tracker);
         }
 
@@ -6127,7 +6877,7 @@ fn refresh_web_snapshot(
         even_age_seconds: bandmap_age_seconds(bandmaps.even_last_updated_at, now),
         odd_age_seconds: bandmap_age_seconds(bandmaps.odd_last_updated_at, now),
     };
-    guard.stations = station_tracker.web_station_summaries();
+    guard.stations = station_tracker.web_station_summaries(now);
     guard.station_logs = station_tracker.web_logs();
     let direct_calls_since = now
         .checked_sub(DIRECT_CALL_PANE_RETENTION)
@@ -7814,6 +8564,7 @@ impl StationTracker {
                 last_message_kind: station_message_kind(&decode.message),
                 last_text: decode.text.clone(),
                 last_structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
+                last_fd_exchange: field_day_exchange_to_our_call(&decode.message, ""),
                 active_qso: None,
                 last_qso_ended_at: None,
                 qso_history: Vec::new(),
@@ -7826,6 +8577,7 @@ impl StationTracker {
         entry.last_heard_slot_family = qso::slot_family_for_mode(self.mode, received_at);
         entry.last_message_kind = station_message_kind(&decode.message);
         entry.last_text = decode.text.clone();
+        entry.last_fd_exchange = field_day_exchange_to_our_call(&decode.message, "");
         entry.last_structured_json = serde_json::to_string(&decode.message).unwrap_or_default();
 
         match transition {
@@ -7926,6 +8678,7 @@ impl StationTracker {
             field2,
             info,
             text: decode.text.clone(),
+            finish_reply: message_is_finish_reply(&decode.message),
         };
         if let Some(existing) = self.logs.iter_mut().find(|entry| {
             entry.sender_call == sender_call && entry.slot_index == current_slot_index
@@ -8050,7 +8803,7 @@ impl StationTracker {
         });
     }
 
-    fn web_station_summaries(&self) -> Vec<WebStationSummary> {
+    fn web_station_summaries(&self, now: SystemTime) -> Vec<WebStationSummary> {
         self.stations
             .iter()
             .map(|(callsign, state)| WebStationSummary {
@@ -8059,6 +8812,10 @@ impl StationTracker {
                 last_heard_freq_hz: state.last_heard_freq_hz,
                 last_heard_snr_db: state.last_heard_snr_db,
                 last_heard_slot_family: state.last_heard_slot_family.as_str().to_string(),
+                finish_count_10m: self.finish_reply_unique_peer_count_since(
+                    callsign,
+                    now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now),
+                ) as u32,
                 is_in_qso: state.active_qso.is_some(),
                 in_qso_since: state.active_qso.as_ref().map(|qso| format_time(qso.since)),
                 qso_with: state
@@ -8088,6 +8845,7 @@ impl StationTracker {
             last_text: (!state.last_text.is_empty()).then(|| state.last_text.clone()),
             last_structured_json: (!state.last_structured_json.is_empty())
                 .then(|| state.last_structured_json.clone()),
+            received_fd_exchange: state.last_fd_exchange.clone(),
         })
     }
 
@@ -8159,6 +8917,20 @@ impl StationTracker {
                 entry.received_at >= since && entry.sender_call.eq_ignore_ascii_case(callsign)
             })
             .count()
+    }
+
+    fn finish_reply_unique_peer_count_since(&self, callsign: &str, since: SystemTime) -> usize {
+        let mut peers = BTreeSet::new();
+        for entry in &self.logs {
+            if entry.received_at >= since
+                && entry.finish_reply
+                && entry.sender_call.eq_ignore_ascii_case(callsign)
+                && let Some(peer) = &entry.peer
+            {
+                peers.insert(self.peer_display(peer));
+            }
+        }
+        peers.len()
     }
 }
 
@@ -8240,6 +9012,32 @@ fn message_ends_qso(message: &StructuredMessage) -> bool {
     }
 }
 
+fn message_is_finish_reply(message: &StructuredMessage) -> bool {
+    match message {
+        StructuredMessage::Standard { info, .. } => match &info.value {
+            StructuredInfoValue::Grid { locator } if locator.eq_ignore_ascii_case("RR73") => true,
+            StructuredInfoValue::Reply {
+                word:
+                    ft8_decoder::ReplyWord::Rrr
+                    | ft8_decoder::ReplyWord::Rr73
+                    | ft8_decoder::ReplyWord::SeventyThree,
+            } => true,
+            _ => false,
+        },
+        StructuredMessage::Nonstandard { reply, .. } => matches!(
+            reply,
+            ft8_decoder::ReplyWord::Rrr
+                | ft8_decoder::ReplyWord::Rr73
+                | ft8_decoder::ReplyWord::SeventyThree
+        ),
+        StructuredMessage::Dxpedition { .. } => true,
+        StructuredMessage::FieldDay { .. }
+        | StructuredMessage::RttyContest { .. }
+        | StructuredMessage::EuVhf { .. } => false,
+        StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => false,
+    }
+}
+
 fn message_is_cq(message: &StructuredMessage) -> bool {
     match message {
         StructuredMessage::Standard { first, .. } => matches!(
@@ -8287,22 +9085,109 @@ fn station_message_kind(message: &StructuredMessage) -> StationLastMessageKind {
     }
 }
 
+fn field_day_exchange_to_our_call(
+    message: &StructuredMessage,
+    our_call: &str,
+) -> Option<qso::FieldDayExchange> {
+    match message {
+        StructuredMessage::FieldDay {
+            first,
+            transmitter_count,
+            class,
+            section,
+            ..
+        } if !our_call.is_empty()
+            && structured_call_station_name(first).as_deref() == Some(our_call) =>
+        {
+            Some(qso::FieldDayExchange::new(
+                *transmitter_count,
+                *class,
+                section.clone(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn is_field_day_auto_add_candidate(message: &StructuredMessage) -> bool {
+    match message {
+        StructuredMessage::FieldDay { .. } => true,
+        StructuredMessage::Standard { first, .. } => matches!(
+            &first.value,
+            StructuredCallValue::Token { token } if token == "CQ FD"
+        ),
+        _ => false,
+    }
+}
+
 fn direct_call_observation_from_decode(
     decode: &DecodedMessage,
     our_call: &str,
     observed_at: SystemTime,
     mode: DecoderMode,
+    field_day_enabled: bool,
+    field_day_only: bool,
 ) -> Option<DirectCallObservation> {
     let sender_call = semantic_sender_call(&decode.message)?;
+    let mut received_fd_exchange = None;
     let (start_state, compound_eligible) = match &decode.message {
+        StructuredMessage::FieldDay {
+            first,
+            acknowledge,
+            transmitter_count,
+            class,
+            section,
+            ..
+        } => {
+            if structured_call_station_name(first).as_deref() != Some(our_call) {
+                return None;
+            }
+            received_fd_exchange = Some(qso::FieldDayExchange::new(
+                *transmitter_count,
+                *class,
+                section.clone(),
+            ));
+            if *acknowledge {
+                (QsoState::SendRR73, false)
+            } else {
+                (QsoState::SendSigAck, false)
+            }
+        }
         StructuredMessage::Standard {
             first,
             acknowledge,
             info,
             ..
         } => {
+            if field_day_enabled && field_day_only {
+                return None;
+            }
             if structured_call_station_name(first).as_deref() != Some(our_call) {
                 return None;
+            }
+            if field_day_enabled
+                && matches!(
+                    info.value,
+                    StructuredInfoValue::Reply {
+                        word: ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree
+                    }
+                )
+            {
+                return None;
+            }
+            if field_day_enabled {
+                return Some(DirectCallObservation {
+                    callsign: sender_call,
+                    observed_at,
+                    slot_index: slot_index_for_mode(mode, observed_at),
+                    slot_family: qso::slot_family_for_mode(mode, observed_at),
+                    snr_db: decode.snr_db,
+                    start_state: QsoState::SendGrid,
+                    compound_eligible: false,
+                    text: decode.text.clone(),
+                    structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
+                    received_fd_exchange: None,
+                });
             }
             match &info.value {
                 StructuredInfoValue::Grid { locator } if locator.eq_ignore_ascii_case("RR73") => {
@@ -8347,9 +9232,32 @@ fn direct_call_observation_from_decode(
             }
         }
         StructuredMessage::Nonstandard { reply, cq, .. } => {
+            if field_day_enabled && field_day_only {
+                return None;
+            }
             if *cq || semantic_first_call_display_call(&decode.message).as_deref() != Some(our_call)
             {
                 return None;
+            }
+            if field_day_enabled {
+                if matches!(
+                    reply,
+                    ft8_decoder::ReplyWord::Rr73 | ft8_decoder::ReplyWord::SeventyThree
+                ) {
+                    return None;
+                }
+                return Some(DirectCallObservation {
+                    callsign: sender_call,
+                    observed_at,
+                    slot_index: slot_index_for_mode(mode, observed_at),
+                    slot_family: qso::slot_family_for_mode(mode, observed_at),
+                    snr_db: decode.snr_db,
+                    start_state: QsoState::SendGrid,
+                    compound_eligible: false,
+                    text: decode.text.clone(),
+                    structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
+                    received_fd_exchange: None,
+                });
             }
             match reply {
                 ft8_decoder::ReplyWord::Blank => (QsoState::SendSig, false),
@@ -8364,6 +9272,9 @@ fn direct_call_observation_from_decode(
             next_call,
             ..
         } => {
+            if field_day_enabled && field_day_only {
+                return None;
+            }
             if structured_call_station_name(completed_call).as_deref() == Some(our_call) {
                 return None;
             }
@@ -8372,9 +9283,7 @@ fn direct_call_observation_from_decode(
             }
             (QsoState::SendSigAck, false)
         }
-        StructuredMessage::FieldDay { .. }
-        | StructuredMessage::RttyContest { .. }
-        | StructuredMessage::EuVhf { .. } => return None,
+        StructuredMessage::RttyContest { .. } | StructuredMessage::EuVhf { .. } => return None,
         StructuredMessage::FreeText { .. } | StructuredMessage::Unsupported { .. } => return None,
     };
     Some(DirectCallObservation {
@@ -8387,6 +9296,7 @@ fn direct_call_observation_from_decode(
         compound_eligible,
         text: decode.text.clone(),
         structured_json: serde_json::to_string(&decode.message).unwrap_or_default(),
+        received_fd_exchange,
     })
 }
 
@@ -8406,6 +9316,8 @@ fn maybe_track_priority_directs(
                 our_call,
                 slot_start,
                 work_queue.current_mode,
+                work_queue.field_day_enabled,
+                work_queue.field_day_only,
             ) else {
                 continue;
             };
@@ -8425,6 +9337,7 @@ fn maybe_track_priority_directs(
                 last_snr_db: observation.snr_db,
                 last_text: Some(observation.text.clone()),
                 last_structured_json: Some(observation.structured_json.clone()),
+                received_fd_exchange: observation.received_fd_exchange.clone(),
             };
             if qso_controller
                 .refresh_reserved_compound_next_station(reserved_station, observation.observed_at)
@@ -8451,7 +9364,11 @@ fn maybe_auto_add_decoded_calls(
     let active_partner = qso_controller.active_partner_call();
     let mut callsigns = BTreeSet::new();
     let since = now.checked_sub(CQ_ACTIVITY_WINDOW).unwrap_or(now);
+    let finish_count_since = now.checked_sub(STATION_FINISH_COUNT_WINDOW).unwrap_or(now);
     for decode in decodes {
+        if work_queue.field_day_enabled && !is_field_day_auto_add_candidate(&decode.message) {
+            continue;
+        }
         let Some(callsign) = semantic_sender_call(&decode.message) else {
             continue;
         };
@@ -8463,6 +9380,12 @@ fn maybe_auto_add_decoded_calls(
     for callsign in callsigns {
         if station_tracker.sender_decode_count_since(since, &callsign)
             < work_queue.auto_add_decoded_min_count_5m as usize
+        {
+            continue;
+        }
+        if work_queue.auto_add_decoded_require_finish_count
+            && station_tracker.finish_reply_unique_peer_count_since(&callsign, finish_count_since)
+                == 0
         {
             continue;
         }
@@ -8486,6 +9409,7 @@ fn station_info_from_dispatch(
         context_text,
         context_structured_json,
         context_snr_db,
+        context_fd_exchange,
         ..
     } = kind
     else {
@@ -8504,6 +9428,9 @@ fn station_info_from_dispatch(
                 info.last_structured_json = context_structured_json
                     .clone()
                     .or_else(|| info.last_structured_json.clone());
+                info.received_fd_exchange = context_fd_exchange
+                    .clone()
+                    .or_else(|| info.received_fd_exchange.clone());
             }
             None => {
                 station_info = Some(StationStartInfo {
@@ -8513,6 +9440,7 @@ fn station_info_from_dispatch(
                     last_snr_db: context_snr_db.unwrap_or(0),
                     last_text: context_text.clone(),
                     last_structured_json: context_structured_json.clone(),
+                    received_fd_exchange: context_fd_exchange.clone(),
                 });
             }
             Some(info) => {
@@ -8524,6 +9452,9 @@ fn station_info_from_dispatch(
                 }
                 if let Some(snr_db) = *context_snr_db {
                     info.last_snr_db = snr_db;
+                }
+                if let Some(exchange) = context_fd_exchange.clone() {
+                    info.received_fd_exchange = Some(exchange);
                 }
             }
         }
@@ -8836,8 +9767,8 @@ fn build_bandmap_grid(
 mod tests {
     use super::*;
     use crate::config::{
-        FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds, RigConfig,
-        StationConfig, TxConfig,
+        FieldDayConfig, FsmConfig, LoggingConfig, NoFwdThreshold, QueueConfig, RetryThresholds,
+        RigConfig, StationConfig, TxConfig,
     };
     use crate::qso::{SlotFamily, TxBackend};
 
@@ -8921,6 +9852,7 @@ mod tests {
                 fsm_log_path: "logs/test-qso.jsonl".to_string(),
                 app_log_path: "logs/test-ft8op.log".to_string(),
             },
+            field_day: FieldDayConfig::default(),
         }
     }
 
@@ -8931,6 +9863,15 @@ mod tests {
             configured_power_request(&config, RigKind::K3s),
             Some(RigPowerRequest::ContinuousWatts(20.0))
         );
+    }
+
+    #[test]
+    fn default_config_loads_field_day_exchange_defaults() {
+        let config = AppConfig::load(Path::new("config/ft8op.json")).expect("load default config");
+        assert_eq!(config.station.our_call, "N1VF");
+        assert_eq!(config.field_day.transmitter_count, 1);
+        assert_eq!(config.field_day.class, 'E');
+        assert_eq!(config.field_day.section, "SCV");
     }
 
     #[test]
@@ -9006,10 +9947,53 @@ mod tests {
         }
     }
 
+    fn directed_reply_decode(from: &str, to: &str, word: ft8_decoder::ReplyWord) -> DecodedMessage {
+        let message = StructuredMessage::Standard {
+            i3: 0,
+            first: standard_call(to),
+            second: standard_call(from),
+            acknowledge: false,
+            info: StructuredInfoField {
+                raw: 0,
+                value: StructuredInfoValue::Reply { word },
+            },
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
     fn cq_decode(from: &str) -> DecodedMessage {
         let message = StructuredMessage::Standard {
             i3: 0,
             first: token_call("CQ"),
+            second: standard_call(from),
+            acknowledge: false,
+            info: grid_info("FN20"),
+        };
+        DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -10,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: message.to_text(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message,
+        }
+    }
+
+    fn cq_fd_decode(from: &str) -> DecodedMessage {
+        let message = StructuredMessage::Standard {
+            i3: 0,
+            first: token_call("CQ FD"),
             second: standard_call(from),
             acknowledge: false,
             info: grid_info("FN20"),
@@ -9397,6 +10381,15 @@ mod tests {
     }
 
     #[test]
+    fn queue_exchange_mode_treats_ft4_as_field_day_when_enabled() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_mode(DecoderMode::Ft4);
+        queue.set_field_day_enabled(true);
+        assert_eq!(queue.exchange_mode(), qso::ExchangeMode::FieldDay);
+    }
+
+    #[test]
     fn ft4_slot_boundaries_preserve_half_second_alignment() {
         let before_half = UNIX_EPOCH + Duration::from_millis(7_499);
         let at_half = UNIX_EPOCH + Duration::from_millis(7_500);
@@ -9532,6 +10525,117 @@ mod tests {
     }
 
     #[test]
+    fn station_finish_count_tracks_unique_peers_in_last_10m() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut tracker = StationTracker::default();
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(590),
+            &directed_reply_decode("RUNNER", "A1", ft8_decoder::ReplyWord::Rr73),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(300),
+            &directed_reply_decode("RUNNER", "B2", ft8_decoder::ReplyWord::Rrr),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(120),
+            &directed_reply_decode("RUNNER", "B2", ft8_decoder::ReplyWord::SeventyThree),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(601),
+            &directed_reply_decode("RUNNER", "C3", ft8_decoder::ReplyWord::Rr73),
+        );
+
+        assert_eq!(
+            tracker
+                .finish_reply_unique_peer_count_since("RUNNER", now - STATION_FINISH_COUNT_WINDOW),
+            2
+        );
+    }
+
+    #[test]
+    fn queue_pick_prefers_fresh_ready_station_with_higher_finish_count() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut tracker = StationTracker::default();
+        ingest_decode(&mut tracker, now, &cq_decode("OLDER"));
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(120),
+            &directed_reply_decode("NEWER", "A1", ft8_decoder::ReplyWord::Rr73),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(90),
+            &directed_reply_decode("NEWER", "B2", ft8_decoder::ReplyWord::Rrr),
+        );
+        ingest_decode(&mut tracker, now, &cq_decode("NEWER"));
+
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.auto_enabled = true;
+        queue.add_station("OLDER", now, now).expect("older queued");
+        queue
+            .add_station(
+                "NEWER",
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(1),
+            )
+            .expect("newer queued");
+
+        let dispatch = queue
+            .scheduler_pick(now + Duration::from_secs(2), &tracker, false, false)
+            .expect("dispatch");
+        assert_eq!(dispatch.callsign, "NEWER");
+    }
+
+    #[test]
+    fn queue_pick_requeued_entries_fall_back_to_oldest_ready() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut tracker = StationTracker::default();
+        ingest_decode(&mut tracker, now, &cq_decode("OLDER"));
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(120),
+            &directed_reply_decode("NEWER", "A1", ft8_decoder::ReplyWord::Rr73),
+        );
+        ingest_decode(
+            &mut tracker,
+            now - Duration::from_secs(90),
+            &directed_reply_decode("NEWER", "B2", ft8_decoder::ReplyWord::Rrr),
+        );
+        ingest_decode(&mut tracker, now, &cq_decode("NEWER"));
+
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.auto_enabled = true;
+        queue
+            .add_station(
+                "OLDER",
+                now - Duration::from_secs(300),
+                now - Duration::from_secs(300),
+            )
+            .expect("older queued");
+        queue
+            .add_station(
+                "NEWER",
+                now - Duration::from_secs(200),
+                now - Duration::from_secs(200),
+            )
+            .expect("newer queued");
+        for entry in &mut queue.entries {
+            entry.ok_to_schedule_after = now - Duration::from_secs(1);
+        }
+
+        let dispatch = queue
+            .scheduler_pick(now, &tracker, false, false)
+            .expect("dispatch");
+        assert_eq!(dispatch.callsign, "OLDER");
+    }
+
+    #[test]
     fn direct_observation_same_slot_does_not_increment_count() {
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
@@ -9546,6 +10650,7 @@ mod tests {
             compound_eligible: true,
             text: "N1VF K1ABC FN20".to_string(),
             structured_json: "{}".to_string(),
+            received_fd_exchange: None,
         };
         queue
             .add_direct_observation(observation.clone(), now)
@@ -9558,7 +10663,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_observation_preserves_retry_backoff() {
+    fn direct_observation_with_forward_progress_overrides_retry_backoff() {
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         let now = UNIX_EPOCH + Duration::from_secs(30);
@@ -9578,10 +10683,49 @@ mod tests {
             slot_index: ft8_slot_index(direct_at),
             slot_family: ft8_slot_family(direct_at),
             snr_db: -5,
-            start_state: QsoState::SendSig,
+            start_state: QsoState::SendRR73,
             compound_eligible: true,
-            text: "N1VF K1ABC FN20".to_string(),
+            text: "N1VF K1ABC R 2A WWA".to_string(),
             structured_json: "{}".to_string(),
+            received_fd_exchange: Some(qso::FieldDayExchange::new(2, 'A', "WWA".to_string())),
+        };
+
+        queue
+            .add_direct_observation(observation, direct_at)
+            .expect("direct update");
+
+        let entry = queue.entries.front().expect("queued entry");
+        assert!(entry.direct_pending);
+        assert_eq!(entry.ok_to_schedule_after, direct_at);
+        assert!(queue.has_recent_priority_direct_for_slot(direct_at, direct_at));
+    }
+
+    #[test]
+    fn repeated_low_progress_direct_observation_preserves_retry_backoff() {
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let direct_at = now + Duration::from_secs(15);
+        let retry_until = now + Duration::from_secs(300);
+        queue
+            .add_station("K1ABC", now, now)
+            .expect("station queued");
+        queue
+            .entries
+            .front_mut()
+            .expect("queued entry")
+            .ok_to_schedule_after = retry_until;
+        let observation = DirectCallObservation {
+            callsign: "K1ABC".to_string(),
+            observed_at: direct_at,
+            slot_index: ft8_slot_index(direct_at),
+            slot_family: ft8_slot_family(direct_at),
+            snr_db: -5,
+            start_state: QsoState::SendSigAck,
+            compound_eligible: false,
+            text: "N1VF K1ABC 2A WWA".to_string(),
+            structured_json: "{}".to_string(),
+            received_fd_exchange: Some(qso::FieldDayExchange::new(2, 'A', "WWA".to_string())),
         };
 
         queue
@@ -9595,12 +10739,69 @@ mod tests {
     }
 
     #[test]
+    fn field_day_direct_observation_starts_at_expected_sequence_point() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let plain = DecodedMessage {
+            utc: "00:00:00".to_string(),
+            snr_db: -5,
+            dt_seconds: 0.1,
+            freq_hz: 1000.0,
+            text: "N1VF K1ABC 2A WWA".to_string(),
+            candidate_score: 0.0,
+            ldpc_iterations: 0,
+            message: StructuredMessage::FieldDay {
+                i3: 0,
+                n3: 3,
+                first: standard_call("N1VF"),
+                second: standard_call("K1ABC"),
+                acknowledge: false,
+                transmitter_count: 2,
+                class: 'A',
+                section: "WWA".to_string(),
+            },
+        };
+        let observation =
+            direct_call_observation_from_decode(&plain, "N1VF", now, DecoderMode::Ft8, true, true)
+                .expect("plain fd direct");
+        assert_eq!(observation.start_state, QsoState::SendSigAck);
+        assert_eq!(
+            observation
+                .received_fd_exchange
+                .as_ref()
+                .map(qso::FieldDayExchange::as_text),
+            Some("2A WWA".to_string())
+        );
+
+        let mut acknowledged = plain.clone();
+        acknowledged.text = "N1VF K1ABC R 2A WWA".to_string();
+        if let StructuredMessage::FieldDay { acknowledge, .. } = &mut acknowledged.message {
+            *acknowledge = true;
+        }
+        let observation = direct_call_observation_from_decode(
+            &acknowledged,
+            "N1VF",
+            now,
+            DecoderMode::Ft8,
+            true,
+            true,
+        )
+        .expect("ack fd direct");
+        assert_eq!(observation.start_state, QsoState::SendRR73);
+    }
+
+    #[test]
     fn dxpedition_direct_to_us_starts_as_send_sig_ack() {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let decode = dxpedition_direct_decode("PY7ZZ", "SP4MCH", "N1VF", -18);
-        let observation =
-            direct_call_observation_from_decode(&decode, "N1VF", now, DecoderMode::Ft8)
-                .expect("direct observation");
+        let observation = direct_call_observation_from_decode(
+            &decode,
+            "N1VF",
+            now,
+            DecoderMode::Ft8,
+            false,
+            false,
+        )
+        .expect("direct observation");
         assert_eq!(observation.callsign, "PY7ZZ");
         assert_eq!(observation.start_state, QsoState::SendSigAck);
         assert!(!observation.compound_eligible);
@@ -9628,9 +10829,15 @@ mod tests {
                 },
             },
         };
-        let observation =
-            direct_call_observation_from_decode(&decode, "N1VF", now, DecoderMode::Ft8)
-                .expect("direct observation");
+        let observation = direct_call_observation_from_decode(
+            &decode,
+            "N1VF",
+            now,
+            DecoderMode::Ft8,
+            false,
+            false,
+        )
+        .expect("direct observation");
         assert_eq!(observation.callsign, "JA1IST");
         assert_eq!(observation.start_state, QsoState::SendRR73);
         assert!(!observation.compound_eligible);
@@ -9653,6 +10860,7 @@ mod tests {
                     compound_eligible: true,
                     text: "N1VF GRID FN20".to_string(),
                     structured_json: "{}".to_string(),
+                    received_fd_exchange: None,
                 },
                 now,
             )
@@ -9669,6 +10877,7 @@ mod tests {
                     compound_eligible: true,
                     text: "N1VF GRID FN20".to_string(),
                     structured_json: "{}".to_string(),
+                    received_fd_exchange: None,
                 },
                 now + Duration::from_secs(15),
             )
@@ -9685,6 +10894,7 @@ mod tests {
                     compound_eligible: false,
                     text: "N1VF SIG -02".to_string(),
                     structured_json: "{}".to_string(),
+                    received_fd_exchange: None,
                 },
                 now + Duration::from_secs(15),
             )
@@ -9707,6 +10917,7 @@ mod tests {
                     compound_eligible: false,
                     text: "N1VF SIG -02".to_string(),
                     structured_json: "{}".to_string(),
+                    received_fd_exchange: None,
                 },
                 now,
             )
@@ -9736,6 +10947,7 @@ mod tests {
                     compound_eligible: false,
                     text: "N1VF SIG -02".to_string(),
                     structured_json: "{}".to_string(),
+                    received_fd_exchange: None,
                 },
                 now,
             )
@@ -9775,6 +10987,7 @@ mod tests {
                 last_snr_db: -5,
                 last_text: None,
                 last_structured_json: None,
+                received_fd_exchange: None,
             }),
             now,
         );
@@ -9821,6 +11034,7 @@ mod tests {
                     last_snr_db: -7,
                     last_text: Some("N1VF NEW1 FN20".to_string()),
                     last_structured_json: Some("{}".to_string()),
+                    received_fd_exchange: None,
                 },
             },
             true,
@@ -9876,6 +11090,7 @@ mod tests {
                 last_snr_db: 2,
                 last_text: Some("N1VF JA1IST R-21".to_string()),
                 last_structured_json: Some("{}".to_string()),
+                received_fd_exchange: None,
             }),
             start_at,
         );
@@ -9983,11 +11198,24 @@ mod tests {
         queue.set_current_band(Some("40m".to_string()));
         queue.handle_qso_outcome(
             &QsoOutcome {
+                session_id: 1,
                 partner_call: "K1ABC".to_string(),
                 exit_reason: "send_grid_no_msg_limit".to_string(),
+                started_at: now,
                 finished_at: now,
+                rig_frequency_hz: None,
                 rig_band: Some("40m".to_string()),
+                app_mode: DecoderMode::Ft8,
                 sent_terminal_73: false,
+                exchange_mode: qso::ExchangeMode::Normal,
+                field_day_mode_active: false,
+                field_day_only: true,
+                sent_fd_exchange: false,
+                sent_fd_exchange_text: String::new(),
+                received_fd_exchange: None,
+                contest_exchange_received: false,
+                completion_confidence: qso::CompletionConfidence::Insufficient,
+                last_rx_event: None,
             },
             &tracker,
         );
@@ -10010,11 +11238,24 @@ mod tests {
         queue.set_current_band(Some("40m".to_string()));
         queue.handle_qso_outcome(
             &QsoOutcome {
+                session_id: 1,
                 partner_call: "K1ABC".to_string(),
                 exit_reason: "send_sig_no_fwd_limit".to_string(),
+                started_at: now,
                 finished_at: now,
+                rig_frequency_hz: None,
                 rig_band: Some("40m".to_string()),
+                app_mode: DecoderMode::Ft8,
                 sent_terminal_73: false,
+                exchange_mode: qso::ExchangeMode::Normal,
+                field_day_mode_active: false,
+                field_day_only: true,
+                sent_fd_exchange: false,
+                sent_fd_exchange_text: String::new(),
+                received_fd_exchange: None,
+                contest_exchange_received: false,
+                completion_confidence: qso::CompletionConfidence::Insufficient,
+                last_rx_event: None,
             },
             &tracker,
         );
@@ -10033,7 +11274,7 @@ mod tests {
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
         queue.set_current_band(Some("40m".to_string()));
-        queue.mark_worked("K1ABC", "40m", now);
+        queue.mark_worked("K1ABC", "40m", qso::ExchangeMode::Normal, now);
         let added = queue.add_station("K1ABC", now, now);
         assert!(added.is_err());
         assert!(queue.entries.is_empty());
@@ -10044,7 +11285,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(30);
         let config = sample_app_config();
         let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
-        queue.mark_worked("K1ABC", "20m", now);
+        queue.mark_worked("K1ABC", "20m", qso::ExchangeMode::Normal, now);
         queue.set_current_band(Some("40m".to_string()));
         let added = queue.add_station("K1ABC", now, now);
         assert!(added.is_ok());
@@ -10069,6 +11310,7 @@ mod tests {
             compound_eligible: false,
             text: "N1VF N1VF FN20".to_string(),
             structured_json: "{}".to_string(),
+            received_fd_exchange: None,
         };
         assert!(queue.add_direct_observation(observation, now).is_err());
         assert!(queue.entries.is_empty());
@@ -10146,6 +11388,75 @@ mod tests {
             .map(|entry| entry.callsign.clone())
             .collect::<Vec<_>>();
         assert_eq!(calls, vec!["ALPHA".to_string(), "BRAVO".to_string()]);
+    }
+
+    #[test]
+    fn auto_add_decoded_calls_can_require_finish_count() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
+        queue.set_auto_add_all_decoded_calls(true);
+        queue.set_auto_add_decoded_min_count_5m(1);
+        queue.set_auto_add_decoded_require_finish_count(true);
+        let mut tracker = StationTracker::default();
+        let controller = qso::QsoController::new(config, Box::new(NoopTxBackend));
+
+        let alpha = cq_decode("ALPHA");
+        tracker.ingest_frame(now, std::slice::from_ref(&alpha));
+        maybe_auto_add_decoded_calls(&mut queue, &tracker, &controller, &[alpha.clone()], now);
+        assert!(queue.entries.is_empty());
+
+        tracker.ingest_frame(
+            now + Duration::from_secs(15),
+            &[directed_reply_decode(
+                "ALPHA",
+                "B1",
+                ft8_decoder::ReplyWord::Rr73,
+            )],
+        );
+        tracker.ingest_frame(now + Duration::from_secs(30), std::slice::from_ref(&alpha));
+        maybe_auto_add_decoded_calls(
+            &mut queue,
+            &tracker,
+            &controller,
+            &[alpha],
+            now + Duration::from_secs(30),
+        );
+
+        let calls = queue
+            .entries
+            .iter()
+            .map(|entry| entry.callsign.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec!["ALPHA".to_string()]);
+    }
+
+    #[test]
+    fn auto_add_decoded_calls_restricts_to_field_day_candidates_in_fd_mode() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let config = sample_app_config();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+        queue.set_current_band(Some("40m".to_string()));
+        queue.set_auto_add_all_decoded_calls(true);
+        queue.set_auto_add_decoded_min_count_5m(1);
+        queue.set_field_day_enabled(true);
+        queue.set_field_day_only(false);
+        let mut tracker = StationTracker::default();
+        let controller = qso::QsoController::new(config, Box::new(NoopTxBackend));
+
+        let normal = cq_decode("NORMAL");
+        let fd = cq_fd_decode("FDCALL");
+        tracker.ingest_frame(now, &[normal.clone(), fd.clone()]);
+
+        maybe_auto_add_decoded_calls(&mut queue, &tracker, &controller, &[normal, fd], now);
+
+        let calls = queue
+            .entries
+            .iter()
+            .map(|entry| entry.callsign.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec!["FDCALL".to_string()]);
     }
 
     #[test]
@@ -10354,6 +11665,7 @@ mod tests {
                 context_text: None,
                 context_structured_json: None,
                 context_snr_db: None,
+                context_fd_exchange: None,
             },
             callsign: "K7VAY".to_string(),
             tx_slot_family: SlotFamily::Even,
@@ -10387,6 +11699,7 @@ mod tests {
                 context_text: Some("N1VF K7VAY DM42".to_string()),
                 context_structured_json: Some("{}".to_string()),
                 context_snr_db: Some(-4),
+                context_fd_exchange: None,
             },
         )
         .expect("station info");
@@ -10422,6 +11735,27 @@ mod tests {
         assert_eq!(scan.history.len(), 1);
         assert_eq!(scan.history[0].callsign, "KJ7JJ");
         assert_eq!(scan.history[0].received_info, "DN17");
+    }
+
+    #[test]
+    fn qso_jsonl_scan_does_not_surface_unanswered_cq_as_qso() {
+        let contents = r#"{"timestamp":"2026-06-27T18:52:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":8,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"idle","state_after":"send_cq","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-06-27T18:52:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":8,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"none","rx_text":"","tx_text":"CQ FD N1VF CM97"}}
+{"timestamp":"2026-06-27T18:52:44Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":8,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"idle","last_rx_event":"send_cq_no_msg_limit","rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert!(scan.history.is_empty());
+    }
+
+    #[test]
+    fn qso_jsonl_scan_does_not_surface_preempted_cq_placeholder() {
+        let contents = r#"{"timestamp":"2026-06-27T18:55:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":9,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"idle","state_after":"send_cq","last_rx_event":"start","rx_text":"","tx_text":""}}
+{"timestamp":"2026-06-27T18:55:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":9,"partner_call":"CQ","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"none","rx_text":"","tx_text":"CQ FD N1VF CM97"}}
+{"timestamp":"2026-06-27T18:56:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_full","session_id":9,"partner_call":"KB5MAR","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"send_cq","last_rx_event":"to_us_fd_exchange","received_fd_exchange":"3F NTX","received_fd_class":"F","received_fd_section":"NTX","contest_exchange_received":true,"rx_text":"N1VF KB5MAR 3F NTX","tx_text":""}}
+{"timestamp":"2026-06-27T18:56:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":9,"partner_call":"KB5MAR","start_mode":"cq","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","state_before":"send_cq","state_after":"idle","last_rx_event":"send_cq_direct_preempt","received_fd_exchange":"3F NTX","received_fd_class":"F","received_fd_section":"NTX","contest_exchange_received":true,"rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert!(scan.history.is_empty());
     }
 
     #[test]
@@ -10470,5 +11804,91 @@ mod tests {
         let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
         assert_eq!(scan.history.len(), 1);
         assert_eq!(scan.history[0].mode, "FT4");
+    }
+
+    #[test]
+    fn qso_jsonl_scan_tracks_recent_worked_by_exchange_mode() {
+        let contents = r#"{"timestamp":"2026-04-04T05:00:00Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":14,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_fd_exchange_ack","exchange_mode":"field_day","rig_band":"40m","rx_text":"","tx_text":"K1ABC N1VF RR73"}}
+{"timestamp":"2026-04-04T05:00:15Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":15,"partner_call":"K1ABC","state_before":"send_rr73","state_after":"send_rr73","last_rx_event":"to_us_ack","rig_band":"20m","rx_text":"","tx_text":"K1ABC N1VF RR73"}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert!(scan.recent_worked.contains_key(&WorkedBandKey {
+            callsign: "K1ABC".to_string(),
+            band: "40m".to_string(),
+            exchange_mode: qso::ExchangeMode::FieldDay,
+        }));
+        assert!(scan.recent_worked.contains_key(&WorkedBandKey {
+            callsign: "K1ABC".to_string(),
+            band: "20m".to_string(),
+            exchange_mode: qso::ExchangeMode::Normal,
+        }));
+    }
+
+    #[test]
+    fn qso_jsonl_scan_surfaces_field_day_exchange_info() {
+        let contents = r#"{"timestamp":"2026-06-27T18:32:42Z","level":"INFO","fields":{"message":"qso_fsm","event":"start","session_id":1,"partner_call":"W6SJC","state_before":"idle","state_after":"send_grid","last_rx_event":"start","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","rx_text":"CQ FD W6SJC CM97","tx_text":""}}
+{"timestamp":"2026-06-27T18:32:45Z","level":"INFO","fields":{"message":"qso_fsm","event":"tx_launch","session_id":1,"partner_call":"W6SJC","state_before":"send_grid","state_after":"send_grid","last_rx_event":"noncall_first_field","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","sent_fd_exchange":true,"rx_text":"","tx_text":"W6SJC N1VF 1E SCV"}}
+{"timestamp":"2026-06-27T18:33:14Z","level":"INFO","fields":{"message":"qso_fsm","event":"rx_slot_full","session_id":1,"partner_call":"W6SJC","state_before":"send_grid","state_after":"send_rr73","last_rx_event":"to_us_fd_exchange_ack","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","received_fd_exchange":"4F SCV","received_fd_class":"F","received_fd_section":"SCV","contest_exchange_received":true,"rx_text":"N1VF W6SJC R 4F SCV","tx_text":""}}
+{"timestamp":"2026-06-27T18:33:44Z","level":"INFO","fields":{"message":"qso_fsm","event":"exit","session_id":1,"partner_call":"W6SJC","state_before":"send_rr73","state_after":"idle","last_rx_event":"send_rr73_confirmed","exchange_mode":"field_day","rig_band":"15m","app_mode":"ft8","received_fd_exchange":"4F SCV","received_fd_class":"F","received_fd_section":"SCV","contest_exchange_received":true,"rx_text":"","tx_text":""}}"#;
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let scan = scan_qso_jsonl(contents, now, UNIX_EPOCH);
+        assert_eq!(scan.history.len(), 1);
+        assert_eq!(scan.history[0].callsign, "W6SJC");
+        assert_eq!(scan.history[0].sent_info, "1E SCV");
+        assert_eq!(scan.history[0].received_info, "4F SCV");
+    }
+
+    #[test]
+    fn exchange_info_parses_field_day_exchange_text() {
+        assert_eq!(
+            extract_exchange_info("N1VF W6SJC R 4F SCV").as_deref(),
+            Some("4F SCV")
+        );
+        assert_eq!(
+            extract_exchange_info("W6SJC N1VF 1E SCV").as_deref(),
+            Some("1E SCV")
+        );
+        assert_eq!(
+            extract_exchange_info("N1VF W6SJC R-07").as_deref(),
+            Some("R-07")
+        );
+    }
+
+    #[test]
+    fn completed_qso_jsonl_appends_field_day_record() {
+        let mut config = sample_app_config();
+        let path =
+            std::env::temp_dir().join(format!("ft8op-completed-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        config.field_day.completed_qso_log_path = path.display().to_string();
+        let now = UNIX_EPOCH + Duration::from_secs(10 * 365 * 24 * 60 * 60);
+        let outcome = QsoOutcome {
+            session_id: 99,
+            partner_call: "K1ABC".to_string(),
+            exit_reason: "send_rr73_partner_moved_on".to_string(),
+            started_at: now - Duration::from_secs(60),
+            finished_at: now,
+            rig_frequency_hz: Some(7_074_000),
+            rig_band: Some("40m".to_string()),
+            app_mode: DecoderMode::Ft8,
+            sent_terminal_73: true,
+            exchange_mode: qso::ExchangeMode::FieldDay,
+            field_day_mode_active: true,
+            field_day_only: true,
+            sent_fd_exchange: true,
+            sent_fd_exchange_text: "1E SCV".to_string(),
+            received_fd_exchange: Some(qso::FieldDayExchange::new(2, 'A', "WWA".to_string())),
+            contest_exchange_received: true,
+            completion_confidence: qso::CompletionConfidence::Confirmed,
+            last_rx_event: Some("to_us_fd_exchange_ack".to_string()),
+        };
+        maybe_append_completed_qso_jsonl(&config, &outcome);
+        let contents = std::fs::read_to_string(&path).expect("completed qso jsonl");
+        assert!(contents.contains("\"call\":\"K1ABC\""));
+        assert!(contents.contains("\"sent_exchange\":\"1E SCV\""));
+        assert!(contents.contains("\"sent_transmitter_count\":1"));
+        assert!(contents.contains("\"received_exchange\":\"2A WWA\""));
+        assert!(contents.contains("\"received_transmitter_count\":2"));
+        let _ = std::fs::remove_file(path);
     }
 }

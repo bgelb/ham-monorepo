@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub queue: QueueConfig,
     pub fsm: FsmConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub field_day: FieldDayConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,12 +89,47 @@ pub struct LoggingConfig {
     pub app_log_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct FieldDayConfig {
+    #[serde(default)]
+    pub enabled_default: bool,
+    #[serde(default = "default_true")]
+    pub fd_only_default: bool,
+    #[serde(default = "default_true")]
+    pub preempt_73_after_rr73_default: bool,
+    #[serde(default = "default_fd_transmitter_count")]
+    pub transmitter_count: u8,
+    #[serde(default = "default_fd_class")]
+    pub class: char,
+    #[serde(default = "default_fd_section")]
+    pub section: String,
+    #[serde(default = "default_fd_completed_qso_log_path")]
+    pub completed_qso_log_path: String,
+}
+
+impl Default for FieldDayConfig {
+    fn default() -> Self {
+        Self {
+            enabled_default: false,
+            fd_only_default: true,
+            preempt_73_after_rr73_default: true,
+            transmitter_count: default_fd_transmitter_count(),
+            class: default_fd_class(),
+            section: default_fd_section(),
+            completed_qso_log_path: default_fd_completed_qso_log_path(),
+        }
+    }
+}
+
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self, AppError> {
         let contents = std::fs::read_to_string(path)?;
         let mut config: Self = serde_json::from_str(&contents)?;
         config.station.our_call = normalize_call(&config.station.our_call);
         config.station.our_grid = config.station.our_grid.trim().to_uppercase();
+        config.field_day.class = config.field_day.class.to_ascii_uppercase();
+        config.field_day.section = config.field_day.section.trim().to_uppercase();
+        config.field_day.transmitter_count = config.field_day.transmitter_count.clamp(1, 32);
         Ok(config)
     }
 
@@ -111,4 +148,24 @@ impl AppConfig {
 
 fn normalize_call(value: &str) -> String {
     value.trim().to_uppercase()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fd_transmitter_count() -> u8 {
+    1
+}
+
+fn default_fd_class() -> char {
+    'E'
+}
+
+fn default_fd_section() -> String {
+    "SCV".to_string()
+}
+
+fn default_fd_completed_qso_log_path() -> String {
+    "logs/ft8op-field-day-completed.jsonl".to_string()
 }
