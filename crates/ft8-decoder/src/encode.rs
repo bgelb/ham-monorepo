@@ -70,6 +70,13 @@ pub enum TxMessage {
         peer_call: String,
         payload: TxDirectedPayload,
     },
+    Nonstandard {
+        hashed_call: String,
+        plain_call: String,
+        hashed_is_second: bool,
+        reply: ReplyWord,
+        cq: bool,
+    },
     DxpeditionCompound {
         finished_call: String,
         next_call: String,
@@ -193,6 +200,23 @@ pub fn synthesize_tx_message(
     options: &WaveformOptions,
 ) -> Result<SynthesizedTxMessage, EncodeError> {
     let (frame, rendered_text) = match message {
+        TxMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            hashed_is_second,
+            reply,
+            cq,
+        } => (
+            encode_nonstandard_message_for_mode(
+                options.mode,
+                hashed_call,
+                plain_call,
+                *hashed_is_second,
+                *reply,
+                *cq,
+            )?,
+            render_nonstandard_message(hashed_call, plain_call, *hashed_is_second, *reply, *cq),
+        ),
         TxMessage::DxpeditionCompound {
             finished_call,
             next_call,
@@ -537,18 +561,28 @@ pub fn encode_eu_vhf_message(
     build_frame_for_mode(Mode::Ft8, message_bits)
 }
 
-pub fn encode_nonstandard_message(
+pub fn encode_nonstandard_message_for_mode(
+    mode: Mode,
     hashed_callsign: &str,
     plain_callsign: &str,
     hashed_is_second: bool,
     reply: ReplyWord,
     cq: bool,
 ) -> Result<EncodedFrame, EncodeError> {
+    if !matches!(mode, Mode::Ft8 | Mode::Ft4) {
+        return Err(EncodeError::UnsupportedModeFeature(
+            "nonstandard callsign messages require ft8 or ft4".to_string(),
+        ));
+    }
     let mut message_bits = [0u8; MESSAGE_BITS];
     write_bit_field(
         &mut message_bits,
         FTX_NONSTANDARD_LAYOUT.hashed_call,
-        hash_callsign(&hashed_callsign.trim().to_uppercase(), 12),
+        if cq {
+            0
+        } else {
+            hash_callsign(&hashed_callsign.trim().to_uppercase(), 12)
+        },
     );
     write_bit_field(
         &mut message_bits,
@@ -571,7 +605,24 @@ pub fn encode_nonstandard_message(
         FTX_NONSTANDARD_LAYOUT.kind,
         u64::from(FTX_MESSAGE_KIND_NONSTANDARD),
     );
-    build_frame_for_mode(Mode::Ft8, message_bits)
+    build_frame_for_mode(mode, message_bits)
+}
+
+pub fn encode_nonstandard_message(
+    hashed_callsign: &str,
+    plain_callsign: &str,
+    hashed_is_second: bool,
+    reply: ReplyWord,
+    cq: bool,
+) -> Result<EncodedFrame, EncodeError> {
+    encode_nonstandard_message_for_mode(
+        Mode::Ft8,
+        hashed_callsign,
+        plain_callsign,
+        hashed_is_second,
+        reply,
+        cq,
+    )
 }
 
 fn build_frame_for_mode(
@@ -933,7 +984,26 @@ fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, 
             payload,
         } => {
             let (acknowledge, info) = tx_payload_fields(payload);
-            let rendered = render_standard_message(peer_call, my_call, acknowledge, &info);
+            let peer_standard = is_standard_callsign(peer_call);
+            let my_standard = is_standard_callsign(my_call);
+            let (rendered_peer, rendered_my) = if peer_standard != my_standard {
+                (
+                    if peer_standard {
+                        peer_call.clone()
+                    } else {
+                        format!("<{}>", peer_call.trim().to_uppercase())
+                    },
+                    if my_standard {
+                        my_call.clone()
+                    } else {
+                        format!("<{}>", my_call.trim().to_uppercase())
+                    },
+                )
+            } else {
+                (peer_call.clone(), my_call.clone())
+            };
+            let rendered =
+                render_standard_message(&rendered_peer, &rendered_my, acknowledge, &info);
             (
                 peer_call.clone(),
                 my_call.clone(),
@@ -942,13 +1012,41 @@ fn tx_message_fields(message: &TxMessage) -> (String, String, bool, GridReport, 
                 rendered,
             )
         }
-        TxMessage::DxpeditionCompound { .. }
+        TxMessage::Nonstandard { .. }
+        | TxMessage::DxpeditionCompound { .. }
         | TxMessage::FieldDay { .. }
         | TxMessage::RttyContest { .. }
         | TxMessage::EuVhf { .. } => {
             panic!("specialized FT8 messages bypass standard field rendering")
         }
     }
+}
+
+fn render_nonstandard_message(
+    hashed_call: &str,
+    plain_call: &str,
+    hashed_is_second: bool,
+    reply: ReplyWord,
+    cq: bool,
+) -> String {
+    let plain = plain_call.trim().to_uppercase();
+    if cq {
+        return format!("CQ {plain}");
+    }
+
+    let hashed = format!("<{}>", hashed_call.trim().to_uppercase());
+    let mut rendered = if hashed_is_second {
+        format!("{plain} {hashed}")
+    } else {
+        format!("{hashed} {plain}")
+    };
+    match reply {
+        ReplyWord::Blank => {}
+        ReplyWord::Rrr => rendered.push_str(" RRR"),
+        ReplyWord::Rr73 => rendered.push_str(" RR73"),
+        ReplyWord::SeventyThree => rendered.push_str(" 73"),
+    }
+    rendered
 }
 
 fn tx_payload_fields(payload: &TxDirectedPayload) -> (bool, GridReport) {
@@ -1190,6 +1288,11 @@ fn encode_standard_callsign(callsign: &str) -> Option<u32> {
         format!("{body:<6}")
     };
     encode_packed_standard_callsign(&raw)
+}
+
+/// Returns whether a callsign fits a standard 28-bit FT8/FT4 callsign field.
+pub fn is_standard_callsign(callsign: &str) -> bool {
+    encode_standard_callsign(&wsjtx_pack28_workaround(callsign)).is_some()
 }
 
 fn encode_packed_standard_callsign(callsign: &str) -> Option<u32> {
@@ -1607,7 +1710,7 @@ mod tests {
         let mut resolver = HashResolver::default();
         resolver.insert_callsign("HF19NY");
         let rendered = payload.to_message(&resolver);
-        assert_eq!(rendered.to_text(), "CQ HF19NY");
+        assert_eq!(rendered.to_text(), "CQ <HF19NY>");
     }
 
     #[test]
@@ -1620,6 +1723,108 @@ mod tests {
         resolver.insert_callsign("A41ZZ");
         let rendered = payload.to_message(&resolver);
         assert_eq!(rendered.to_text(), "YO7CGS A41ZZ -11");
+    }
+
+    #[test]
+    fn classifies_wsjt_standard_and_prefixed_callsigns() {
+        assert!(is_standard_callsign("W9XYZ"));
+        assert!(is_standard_callsign(" k1abc "));
+        assert!(!is_standard_callsign("LA/AG4ZP"));
+    }
+
+    #[test]
+    fn nonstandard_cq_round_trips_in_ft8_and_ft4() {
+        for mode in [Mode::Ft8, Mode::Ft4] {
+            let message = TxMessage::Nonstandard {
+                hashed_call: "LA/AG4ZP".to_string(),
+                plain_call: "LA/AG4ZP".to_string(),
+                hashed_is_second: false,
+                reply: ReplyWord::Blank,
+                cq: true,
+            };
+            let synthesized = synthesize_tx_message(&message, &WaveformOptions::for_mode(mode))
+                .expect("synthesize nonstandard CQ");
+            assert_eq!(synthesized.rendered_text, "CQ LA/AG4ZP");
+            let payload = unpack_message_for_mode(mode, &synthesized.frame.codeword_bits)
+                .expect("unpack nonstandard CQ");
+            assert_eq!(
+                payload.to_message(&HashResolver::default()).to_text(),
+                "CQ LA/AG4ZP"
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_local_callsign_uses_wsjt_2_7_message_sequence() {
+        let options = WaveformOptions::for_mode(Mode::Ft8);
+        let cases = [
+            (
+                TxMessage::Nonstandard {
+                    hashed_call: "W9XYZ".to_string(),
+                    plain_call: "LA/AG4ZP".to_string(),
+                    hashed_is_second: false,
+                    reply: ReplyWord::Blank,
+                    cq: false,
+                },
+                "<W9XYZ> LA/AG4ZP",
+            ),
+            (
+                TxMessage::Directed {
+                    my_call: "LA/AG4ZP".to_string(),
+                    peer_call: "W9XYZ".to_string(),
+                    payload: TxDirectedPayload::Signal(-7),
+                },
+                "W9XYZ <LA/AG4ZP> -07",
+            ),
+            (
+                TxMessage::Directed {
+                    my_call: "LA/AG4ZP".to_string(),
+                    peer_call: "W9XYZ".to_string(),
+                    payload: TxDirectedPayload::SignalWithAck(-7),
+                },
+                "W9XYZ <LA/AG4ZP> R-07",
+            ),
+            (
+                TxMessage::Nonstandard {
+                    hashed_call: "W9XYZ".to_string(),
+                    plain_call: "LA/AG4ZP".to_string(),
+                    hashed_is_second: false,
+                    reply: ReplyWord::Rr73,
+                    cq: false,
+                },
+                "<W9XYZ> LA/AG4ZP RR73",
+            ),
+            (
+                TxMessage::Nonstandard {
+                    hashed_call: "W9XYZ".to_string(),
+                    plain_call: "LA/AG4ZP".to_string(),
+                    hashed_is_second: false,
+                    reply: ReplyWord::Rrr,
+                    cq: false,
+                },
+                "<W9XYZ> LA/AG4ZP RRR",
+            ),
+            (
+                TxMessage::Nonstandard {
+                    hashed_call: "W9XYZ".to_string(),
+                    plain_call: "LA/AG4ZP".to_string(),
+                    hashed_is_second: false,
+                    reply: ReplyWord::SeventyThree,
+                    cq: false,
+                },
+                "<W9XYZ> LA/AG4ZP 73",
+            ),
+        ];
+
+        let mut resolver = HashResolver::default();
+        resolver.insert_callsign("W9XYZ");
+        resolver.insert_callsign("LA/AG4ZP");
+        for (message, expected) in cases {
+            let synthesized = synthesize_tx_message(&message, &options).expect("synthesize");
+            assert_eq!(synthesized.rendered_text, expected);
+            let payload = unpack_message(&synthesized.frame.codeword_bits).expect("unpack");
+            assert_eq!(payload.to_message(&resolver).to_text(), expected);
+        }
     }
 
     #[test]

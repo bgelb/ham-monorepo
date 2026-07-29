@@ -981,7 +981,7 @@ fn render_structured_call(field: &StructuredCallField) -> String {
         StructuredCallValue::Hash22 {
             resolved_callsign: Some(callsign),
             ..
-        } => callsign.clone(),
+        } => format!("<{callsign}>"),
         StructuredCallValue::Hash22 {
             resolved_callsign: None,
             ..

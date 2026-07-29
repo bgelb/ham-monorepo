@@ -13,6 +13,7 @@ use ft8_decoder::{
     AudioBuffer, CallModifier, DecodeOptions, DecodeProfile, DecodeStage, DecodedMessage,
     DecoderSession, DecoderState, Mode as DecoderMode, StageDecodeReport, StructuredCallField,
     StructuredCallValue, StructuredInfoField, StructuredInfoValue, StructuredMessage,
+    is_standard_callsign,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use qso::{
@@ -883,6 +884,16 @@ impl WorkQueueState {
         if callsign.eq_ignore_ascii_case(&self.our_call) {
             info!(callsign, "queue_add_rejected_own_call");
             return Err("cannot queue our own call".to_string());
+        }
+        if !is_standard_callsign(&self.our_call) && !is_standard_callsign(callsign) {
+            info!(
+                callsign,
+                our_call = %self.our_call,
+                "queue_add_rejected_two_nonstandard_calls"
+            );
+            return Err(
+                "WSJT-X 2.7 does not support a QSO between two nonstandard callsigns".to_string(),
+            );
         }
         if self.was_worked_recently_on_current_band(callsign, now) {
             info!(callsign, "queue_add_rejected_recently_worked");
@@ -5258,11 +5269,13 @@ fn run_continuous(cli: Cli) -> Result<(), AppError> {
     )?;
     let (job_tx, job_rx) = mpsc::sync_channel::<DecodeJob>(1);
     let (event_tx, event_rx) = mpsc::channel::<DecodeEvent>();
+    let decoder_our_call = config.station.our_call.clone();
     thread::spawn(move || {
         let mut session_slot: Option<SystemTime> = None;
         let mut session_mode: DecoderMode = DecoderMode::Ft8;
         let mut session = DecoderSession::new();
         let mut state = DecoderState::new();
+        state.insert_callsign(&decoder_our_call);
         while let Ok(job) = job_rx.recv() {
             let full_authoritative_reset = job.mode == DecoderMode::Ft8
                 && job.stage == DecodeStage::Full
@@ -9394,6 +9407,20 @@ mod tests {
             .expect("dispatch");
         assert_eq!(dispatch.callsign, "K1ABC");
         assert_eq!(queue.scheduler_status, "dispatching K1ABC");
+    }
+
+    #[test]
+    fn queue_rejects_two_nonstandard_callsigns() {
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let mut config = sample_app_config();
+        config.station.our_call = "LA/AG4ZP".to_string();
+        let mut queue = WorkQueueState::new(&config, 900.0, BTreeMap::new());
+
+        let error = queue
+            .add_station("PJ4/K1ABC", now, now)
+            .expect_err("two nonstandard calls should be rejected");
+        assert!(error.contains("WSJT-X 2.7"));
+        assert!(queue.entries.is_empty());
     }
 
     #[test]

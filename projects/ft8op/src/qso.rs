@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use chrono::{DateTime, Utc};
 use ft8_decoder::{
     DecodeStage, Mode, ReplyWord, StructuredInfoValue, StructuredMessage, TxDirectedPayload,
-    TxMessage, WaveformOptions, synthesize_tx_message,
+    TxMessage, WaveformOptions, is_standard_callsign, synthesize_tx_message,
 };
 use rigctl::Rig;
 use rigctl::audio::{AudioDevice, PreparedMonoPlaybackWriter, prepare_mono_playback_writer};
@@ -1573,6 +1573,17 @@ impl QsoController {
         station_info: Option<StationStartInfo>,
         now: SystemTime,
     ) {
+        if start_mode != QsoStartMode::Cq
+            && !is_standard_callsign(&self.config.station.our_call)
+            && !is_standard_callsign(&partner_call)
+        {
+            warn!(
+                partner_call,
+                our_call = %self.config.station.our_call,
+                "qso start rejected because WSJT-X 2.7 cannot work two nonstandard callsigns"
+            );
+            return;
+        }
         if self.session.is_some() {
             warn!(
                 partner_call,
@@ -2858,28 +2869,14 @@ fn build_tx_request(
                 report_db: clamp_report_db(handoff.next_station.last_snr_db),
             }
         } else if session.state == QsoState::SendCq {
-            TxMessage::Cq {
-                my_call: config.station.our_call.clone(),
-                my_grid: Some(config.station.our_grid.clone()),
-            }
+            build_cq_tx_message(config)
         } else {
-            TxMessage::Directed {
-                my_call: config.station.our_call.clone(),
-                peer_call: session.partner_call.clone(),
-                payload,
-            }
+            build_directed_tx_message(config, session, payload)
         }
     } else if session.state == QsoState::SendCq {
-        TxMessage::Cq {
-            my_call: config.station.our_call.clone(),
-            my_grid: Some(config.station.our_grid.clone()),
-        }
+        build_cq_tx_message(config)
     } else {
-        TxMessage::Directed {
-            my_call: config.station.our_call.clone(),
-            peer_call: session.partner_call.clone(),
-            payload,
-        }
+        build_directed_tx_message(config, session, payload)
     };
     let message_text = render_tx_message(config, session);
     TxRequest {
@@ -2895,33 +2892,121 @@ fn build_tx_request(
     }
 }
 
+fn build_cq_tx_message(config: &AppConfig) -> TxMessage {
+    if is_standard_callsign(&config.station.our_call) {
+        TxMessage::Cq {
+            my_call: config.station.our_call.clone(),
+            my_grid: Some(config.station.our_grid.clone()),
+        }
+    } else {
+        TxMessage::Nonstandard {
+            hashed_call: config.station.our_call.clone(),
+            plain_call: config.station.our_call.clone(),
+            hashed_is_second: false,
+            reply: ReplyWord::Blank,
+            cq: true,
+        }
+    }
+}
+
+fn build_directed_tx_message(
+    config: &AppConfig,
+    session: &ActiveSession,
+    payload: TxDirectedPayload,
+) -> TxMessage {
+    let our_standard = is_standard_callsign(&config.station.our_call);
+    let peer_standard = is_standard_callsign(&session.partner_call);
+    let type4_reply = match &payload {
+        TxDirectedPayload::Blank | TxDirectedPayload::Grid(_) => Some(ReplyWord::Blank),
+        TxDirectedPayload::Reply(reply) => Some(*reply),
+        TxDirectedPayload::Signal(_) | TxDirectedPayload::SignalWithAck(_) => None,
+    };
+
+    if our_standard != peer_standard
+        && let Some(reply) = type4_reply
+    {
+        let (hashed_call, plain_call, hashed_is_second) = if our_standard {
+            (
+                config.station.our_call.clone(),
+                session.partner_call.clone(),
+                true,
+            )
+        } else {
+            (
+                session.partner_call.clone(),
+                config.station.our_call.clone(),
+                false,
+            )
+        };
+        TxMessage::Nonstandard {
+            hashed_call,
+            plain_call,
+            hashed_is_second,
+            reply,
+            cq: false,
+        }
+    } else {
+        TxMessage::Directed {
+            my_call: config.station.our_call.clone(),
+            peer_call: session.partner_call.clone(),
+            payload,
+        }
+    }
+}
+
 fn render_tx_message(config: &AppConfig, session: &ActiveSession) -> String {
     if let Some(handoff) = &session.pending_compound_handoff {
         if matches!(session.state, QsoState::SendRR73 | QsoState::Send73Once) {
             return handoff.tx_text.clone();
         }
     }
+    let our_standard = is_standard_callsign(&config.station.our_call);
+    let peer_standard = is_standard_callsign(&session.partner_call);
+    let one_nonstandard = our_standard != peer_standard;
+    let displayed_our_call = if one_nonstandard && !our_standard {
+        format!("<{}>", config.station.our_call)
+    } else {
+        config.station.our_call.clone()
+    };
+    let displayed_peer_call = if one_nonstandard && !peer_standard {
+        format!("<{}>", session.partner_call)
+    } else {
+        session.partner_call.clone()
+    };
+    let type4_calls = if our_standard {
+        format!("{} <{}>", session.partner_call, config.station.our_call)
+    } else {
+        format!("<{}> {}", session.partner_call, config.station.our_call)
+    };
+
     match session.state {
         QsoState::Idle => String::new(),
+        QsoState::SendCq if !our_standard => format!("CQ {}", config.station.our_call),
         QsoState::SendCq => format!("CQ {} {}", config.station.our_call, config.station.our_grid),
+        QsoState::SendGrid if one_nonstandard => type4_calls,
         QsoState::SendGrid => format!(
             "{} {} {}",
             session.partner_call, config.station.our_call, config.station.our_grid
         ),
         QsoState::SendSig => format!(
             "{} {} {:+03}",
-            session.partner_call,
-            config.station.our_call,
+            displayed_peer_call,
+            displayed_our_call,
             clamp_report_db(session.latest_partner_snr_db)
         ),
         QsoState::SendSigAck => format!(
             "{} {} R{:+03}",
-            session.partner_call,
-            config.station.our_call,
+            displayed_peer_call,
+            displayed_our_call,
             clamp_report_db(session.latest_partner_snr_db)
         ),
+        QsoState::SendRR73 if one_nonstandard => format!("{type4_calls} RR73"),
         QsoState::SendRR73 => format!("{} {} RR73", session.partner_call, config.station.our_call),
+        QsoState::SendRRR if one_nonstandard => format!("{type4_calls} RRR"),
         QsoState::SendRRR => format!("{} {} RRR", session.partner_call, config.station.our_call),
+        QsoState::Send73 | QsoState::Send73Once if one_nonstandard => {
+            format!("{type4_calls} 73")
+        }
         QsoState::Send73 | QsoState::Send73Once => {
             format!("{} {} 73", session.partner_call, config.station.our_call)
         }
@@ -4116,6 +4201,97 @@ mod tests {
             start_mode: QsoStartMode::Normal,
             tx_slot_family_override: None,
         }
+    }
+
+    #[test]
+    fn prefixed_local_call_uses_wsjt_2_7_tx_sequence() {
+        let mut config = sample_config();
+        config.station.our_call = "LA/AG4ZP".to_string();
+        let mut controller = QsoController::new(config, Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("W9XYZ", 1000.0),
+            Some(station_start_info("W9XYZ", now, SlotFamily::Even)),
+            now,
+        );
+
+        let cases = [
+            (QsoState::SendGrid, "<W9XYZ> LA/AG4ZP", true),
+            (QsoState::SendSig, "W9XYZ <LA/AG4ZP> -07", false),
+            (QsoState::SendSigAck, "W9XYZ <LA/AG4ZP> R-07", false),
+            (QsoState::SendRR73, "<W9XYZ> LA/AG4ZP RR73", true),
+            (QsoState::SendRRR, "<W9XYZ> LA/AG4ZP RRR", true),
+            (QsoState::Send73, "<W9XYZ> LA/AG4ZP 73", true),
+        ];
+        for (state, expected, uses_type4) in cases {
+            let session = controller.session.as_mut().expect("session");
+            session.state = state;
+            session.latest_partner_snr_db = -7;
+            let request = build_tx_request(
+                &controller.config,
+                controller.session.as_ref().expect("session"),
+                now + Duration::from_secs(15),
+            );
+            assert_eq!(request.message_text, expected);
+            assert_eq!(
+                matches!(request.message, TxMessage::Nonstandard { .. }),
+                uses_type4
+            );
+        }
+    }
+
+    #[test]
+    fn prefixed_peer_call_keeps_standard_local_call_hashed_in_type4() {
+        let mut controller =
+            QsoController::new(sample_config(), Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("LA/AG4ZP", 1000.0),
+            Some(station_start_info("LA/AG4ZP", now, SlotFamily::Even)),
+            now,
+        );
+        let request = build_tx_request(
+            &controller.config,
+            controller.session.as_ref().expect("session"),
+            now + Duration::from_secs(15),
+        );
+        assert_eq!(request.message_text, "LA/AG4ZP <N1VF>");
+        assert!(matches!(
+            request.message,
+            TxMessage::Nonstandard {
+                hashed_is_second: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cq_with_prefixed_call_uses_type4_without_grid() {
+        let mut config = sample_config();
+        config.station.our_call = "LA/AG4ZP".to_string();
+        let message = build_cq_tx_message(&config);
+        assert!(matches!(
+            message,
+            TxMessage::Nonstandard {
+                cq: true,
+                reply: ReplyWord::Blank,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn qso_rejects_two_nonstandard_callsigns() {
+        let mut config = sample_config();
+        config.station.our_call = "LA/AG4ZP".to_string();
+        let mut controller = QsoController::new(config, Box::new(MockTxBackend::default()));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+        controller.handle_command(
+            start_command("PJ4/K1ABC", 1000.0),
+            Some(station_start_info("PJ4/K1ABC", now, SlotFamily::Even)),
+            now,
+        );
+        assert!(!controller.snapshot(now).active);
     }
 
     #[test]
