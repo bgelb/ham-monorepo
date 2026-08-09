@@ -595,6 +595,23 @@ Each JSONL record includes, among other fields:
 - TX text
 - compound handoff metadata when applicable
 
+### ADIF export
+
+Export conservative, LoTW-ready QSO records from the JSONL log with:
+
+```sh
+cargo run -p ft8op -- export-adif \
+  --config projects/ft8op/config/ft8op.json \
+  --input logs/ft8op-qso.jsonl \
+  --output logs/ft8op-lotw.adi
+```
+
+`--input` defaults to `logging.fsm_log_path` from the selected config, and
+`--output` defaults to stdout. The exporter includes only QSOs with both signal
+reports, a directed reply and acknowledgement, and a terminal 73/RR73 state.
+It also rejects sessions logged under a station callsign different from the
+selected config.
+
 The text log includes:
 
 - queue add/remove/requeue decisions
