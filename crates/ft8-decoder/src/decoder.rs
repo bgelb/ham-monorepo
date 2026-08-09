@@ -1533,7 +1533,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            resolved_texts.contains(&"CQ HF19NY"),
+            resolved_texts.contains(&"CQ <HF19NY>"),
             "expected resolved call in {resolved_texts:?}"
         );
     }
@@ -1722,7 +1722,7 @@ mod tests {
             .map(|decode| decode.text.as_str())
             .collect();
         assert!(
-            resolved_texts.contains(&"HF19NY K1ABC R-07"),
+            resolved_texts.contains(&"<HF19NY> K1ABC R-07"),
             "expected resolved hashed partner in {resolved_texts:?}"
         );
     }
